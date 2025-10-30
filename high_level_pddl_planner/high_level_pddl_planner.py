@@ -94,7 +94,7 @@ class PDDLPlanner:
     def run_fast_downward(self, domain_file: str, problem_file: str) -> PlanningResult:
         """Call Fast Downward to generate a plan."""
         cmd = [
-            "uv", "run", "./fast-downward/fast-downward.py",
+            "python3", "./fast-downward/fast-downward.py",
             domain_file,
             problem_file,
             "--search", "astar(lmcut())"

@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/Kong/Desktop/final_project/final-proj/fast-downward/builds/release/cmake_install.cmake",
+		"C:/Users/Kong/Desktop/final_project/final-proj/fast-downward/builds/release/search/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
