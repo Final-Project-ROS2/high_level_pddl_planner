@@ -1,160 +1,583 @@
-import subprocess
+"""
+ROS2 High-Level Agent Node (PDDL-based)
+
+Replaces the previous "LLM -> direct steps" workflow with:
+LLM (with vision tools) -> generate PDDL domain & problem -> run Fast Downward -> parse plan -> dispatch steps to /medium_level
+
+Keep your vision services & medium-level action server available.
+"""
+import os
 import re
+import tempfile
+import threading
+import time
+import subprocess
 from pathlib import Path
-from typing import List, Dict, Any
-from pydantic import BaseModel, Field
+from typing import List, Dict, Any, Optional
 
-# --- New imports for PDDL pipeline ---
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionServer, ActionClient, CancelResponse, GoalResponse
+from rclpy.task import Future as RclpyFuture
+
+from std_srvs.srv import SetBool
+from std_msgs.msg import String
+from geometry_msgs.msg import Pose
+
+# Action used for inter-level communication (Prompt action)
+from custom_interfaces.action import Prompt
+
+# LangChain LLM/agent imports
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import BaseTool, tool
 from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_core.tools import tool
 
-class PDDLGenerationResult(BaseModel):
-    domain_pddl: str = Field(description="Generated PDDL domain file")
-    problem_pddl: str = Field(description="Generated PDDL problem file")
-    reasoning: str = Field(description="Reasoning for the PDDL design")
+from dotenv import load_dotenv
 
-class PlanningResult(BaseModel):
-    status: str
-    return_code: int
-    stdout: str
-    stderr: str
-    plan: str = ""
-    plan_length: int = 0
+# Load env
+ENV_PATH = '/home/group11/final_project_ws/src/high_level_pddl_planner/.env'
+load_dotenv(dotenv_path=ENV_PATH)
 
-class PDDLPlanner:
-    """Handles PDDL generation and planning using an LLM + Fast Downward."""
+# Fast Downward path: set FAST_DOWNWARD_PY env or default
+FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", "./fast-downward/fast-downward.py")
 
-    def __init__(self, api_key: str, model_name="gemini-2.5-flash"):
-        self.llm = ChatGoogleGenerativeAI(
-            model=model_name,
-            google_api_key=api_key,
-            temperature=0
+
+class PDDLGenerationResult:
+    def __init__(self, domain_pddl: str, problem_pddl: str, reasoning: str = ""):
+        self.domain_pddl = domain_pddl
+        self.problem_pddl = problem_pddl
+        self.reasoning = reasoning
+
+
+class PlanningResult:
+    def __init__(self, status: str, return_code: int, stdout: str, stderr: str, plan: str = ""):
+        self.status = status
+        self.return_code = return_code
+        self.stdout = stdout
+        self.stderr = stderr
+        self.plan = plan
+        self.plan_length = len([l for l in plan.splitlines() if l.strip()])
+
+
+class Ros2HighLevelAgentNode(Node):
+    def __init__(self):
+        super().__init__("ros2_high_level_agent_pddl")
+        self.get_logger().info("Initializing Ros2 High-Level Agent Node (PDDL mode)...")
+
+        self.declare_parameter("real_hardware", False)
+        self.real_hardware: bool = self.get_parameter("real_hardware").get_parameter_value().bool_value
+
+        # LLM init (Gemini or configured model)
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            self.get_logger().warn("No LLM API key found in environment variable GEMINI_API_KEY.")
+
+        # Configure LLM; temperature 0 to favor deterministic outputs for PDDL
+        self.llm = ChatGoogleGenerativeAI(model=os.getenv("LLM_MODEL", "gemini-2.5-flash"),
+                                          google_api_key=api_key, temperature=0.0)
+
+        # Transcript subscription
+        self.transcript_sub = self.create_subscription(String, "/transcript", self.transcript_callback, 10)
+        self._last_transcript_lock = threading.Lock()
+        self._last_transcript: Optional[str] = None
+
+        # Medium-level action client
+        self.medium_level_client = ActionClient(self, Prompt, "/medium_level")
+
+        # Vision service clients (placeholders, same as before)
+        self.vision_detect_client = self.create_client(SetBool, "/vision/detect_objects")
+        self.vision_segment_client = self.create_client(SetBool, "/vision/segment_object")
+        self.vision_classify_client = self.create_client(SetBool, "/vision/classify_region")
+        self.vision_depth_client = self.create_client(SetBool, "/vision/get_depth_at_pixel")
+
+        # Track tools called
+        self._tools_called: List[str] = []
+        self._tools_called_lock = threading.Lock()
+
+        # Initialize LangChain tools and agent
+        self.tools = self._initialize_tools()
+        self.agent_executor = self._create_pddl_agent_executor()
+
+        # High-level action server (Prompt action)
+        self._action_server = ActionServer(
+            self,
+            Prompt,
+            "prompt_high_level",
+            execute_callback=self.execute_callback,
+            goal_callback=self.goal_callback,
+            cancel_callback=self.cancel_callback,
         )
-        self.agent = self._create_pddl_agent()
 
-    def _create_pddl_agent(self) -> AgentExecutor:
-        """Create an LLM agent for generating PDDL domain & problem."""
-        system_prompt = """You are a PDDL expert. 
-        Given a high-level natural language instruction, generate:
-        1. A valid PDDL domain.
-        2. A valid PDDL problem.
-        Use standard PDDL structure and ensure syntax correctness.
-        Provide both inside ```pddl``` code blocks."""
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            ("human", "{input}")
-        ])
-        return create_tool_calling_agent(self.llm, [], prompt)
+        # Response publisher
+        self.response_pub = self.create_publisher(String, "/response", 10)
 
-    def generate_pddl(self, instruction: str) -> PDDLGenerationResult:
-        """Use the LLM to produce domain/problem PDDL from natural language."""
-        query = f"""
-        Generate PDDL domain and problem files for this task:
-        {instruction}
-        Format response as:
-        REASONING:
-        [reasoning]
-        DOMAIN:
-        ```pddl
-        [domain content]
-        ```
-        PROBLEM:
-        ```pddl
-        [problem content]
-        ```
+        self.get_logger().info("Ros2 High-Level Agent Node (PDDL) ready.")
+
+    # -----------------------
+    # Transcript handling
+    # -----------------------
+    def transcript_callback(self, msg: String):
+        text = msg.data.strip()
+        if not text:
+            return
+        with self._last_transcript_lock:
+            self._last_transcript = text
+        self.get_logger().info(f"Received transcript: {text}")
+        plan_thread = threading.Thread(target=self._plan_and_dispatch_from_transcript, args=(text,), daemon=True)
+        plan_thread.start()
+
+    def _plan_and_dispatch_from_transcript(self, instruction_text: str):
         """
-        response = self.agent.invoke({"input": query})
-        text = response["output"]
+        Full pipeline:
+         - Reset tools_called
+         - Ask agent (LLM) to generate PDDL domain & problem (agent may call vision tools)
+         - Save files to temp dir
+         - Run Fast Downward
+         - Parse plan -> list of textual steps
+         - Dispatch steps to /medium_level synchronously
+        """
+        with self._tools_called_lock:
+            self._tools_called = []
 
-        reasoning = re.search(r"REASONING:\s*(.*?)(?=DOMAIN:|$)", text, re.DOTALL)
-        domain = re.search(r"DOMAIN:\s*```pddl\s*(.*?)```", text, re.DOTALL)
-        problem = re.search(r"PROBLEM:\s*```pddl\s*(.*?)```", text, re.DOTALL)
-
-        if not (domain and problem):
-            raise ValueError("Failed to parse PDDL output from LLM.")
-
-        return PDDLGenerationResult(
-            domain_pddl=domain.group(1).strip(),
-            problem_pddl=problem.group(1).strip(),
-            reasoning=reasoning.group(1).strip() if reasoning else ""
-        )
-
-    def save_pddl(self, pddl: PDDLGenerationResult, output_dir="pddl") -> Dict[str, str]:
-        """Save domain and problem files."""
-        path = Path(output_dir)
-        path.mkdir(exist_ok=True)
-        domain_path = path / "domain.pddl"
-        problem_path = path / "problem.pddl"
-        with open(domain_path, "w") as f: f.write(pddl.domain_pddl)
-        with open(problem_path, "w") as f: f.write(pddl.problem_pddl)
-        return {"domain": str(domain_path), "problem": str(problem_path)}
-
-    def run_fast_downward(self, domain_file: str, problem_file: str) -> PlanningResult:
-        """Call Fast Downward to generate a plan."""
-        cmd = [
-            "python3", "./fast-downward/fast-downward.py",
-            domain_file,
-            problem_file,
-            "--search", "astar(lmcut())"
-        ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            self.get_logger().info("PDDL pipeline: requesting PDDL generation from agent...")
+            self.response_pub.publish(String(data="Analyzing scene and generating PDDL..."))
+
+            # Prepare input: embed instruction plus minimal context placeholder
+            # (If you want, you can first call detect_objects or other vision tools here and
+            # include their outputs in the input string. Agent can also call tools itself.)
+            agent_resp = self.agent_executor.invoke({"input": instruction_text})
+            final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
+            self.get_logger().info(f"Agent output (raw):\n{final_text}")
+            self.response_pub.publish(String(data="LLM produced PDDL text — parsing..."))
+
+            # Extract domain and problem from the LLM output
+            pddl_gen = self._parse_pddl_from_text(final_text)
+            if pddl_gen is None:
+                self.get_logger().error("Failed to parse PDDL domain/problem from LLM output.")
+                self.response_pub.publish(String(data="Failed to extract PDDL. Try again or adjust prompt."))
+                return
+
+            # Save PDDL to temporary directory
+            tmpdir = tempfile.mkdtemp(prefix="pddl_")
+            domain_path = Path(tmpdir) / "domain.pddl"
+            problem_path = Path(tmpdir) / "problem.pddl"
+            domain_path.write_text(pddl_gen.domain_pddl)
+            problem_path.write_text(pddl_gen.problem_pddl)
+            self.get_logger().info(f"PDDL files saved to {tmpdir}")
+            self.get_logger().debug(f"Domain:\n{pddl_gen.domain_pddl}")
+            self.get_logger().debug(f"Problem:\n{pddl_gen.problem_pddl}")
+
+            # Run Fast Downward
+            self.response_pub.publish(String(data="Solving with Fast Downward..."))
+            plan_result = self._run_fast_downward(str(domain_path), str(problem_path))
+            if plan_result.status != "success" or not plan_result.plan.strip():
+                self.get_logger().warn(f"Planner returned no plan. status={plan_result.status} rc={plan_result.return_code}")
+                self.response_pub.publish(String(data=f"PDDL solver failed or found no plan. stderr: {plan_result.stderr[:200]}"))
+                return
+
+            self.get_logger().info("Plan obtained from Fast Downward. Parsing to steps...")
+            plan_lines = self._parse_plan_text(plan_result.plan)
+            if not plan_lines:
+                self.get_logger().warn("No actionable plan lines parsed.")
+                self.response_pub.publish(String(data="No actionable steps parsed from plan."))
+                return
+
+            self.response_pub.publish(String(data=f"Plan found with {len(plan_lines)} steps. Executing..."))
+            # Dispatch steps to medium_level
+            for i, step in enumerate(plan_lines, start=1):
+                start_msg = f"Executing plan step {i}/{len(plan_lines)}: {step}"
+                self.response_pub.publish(String(data=start_msg))
+                self.get_logger().info(start_msg)
+                result = self.send_step_to_medium(step)
+                if result is None:
+                    err_msg = f"Failed to send step {i}. Aborting."
+                    self.response_pub.publish(String(data=err_msg))
+                    self.get_logger().error(err_msg)
+                    break
+                else:
+                    if result.success:
+                        ok_msg = f"Step {i} finished successfully: {result.final_response}"
+                    else:
+                        ok_msg = f"Step {i} executed but reported failure: {result.final_response}"
+                    self.response_pub.publish(String(data=ok_msg))
+                    self.get_logger().info(ok_msg)
+
+            self.response_pub.publish(String(data="Plan execution finished (or aborted)."))
+
+        except Exception as e:
+            self.get_logger().error(f"Exception in PDDL planning pipeline: {e}")
+            self.response_pub.publish(String(data=f"Planning error: {e}"))
+
+    # -----------------------
+    # PDDL parsing & Fast Downward helpers
+    # -----------------------
+    def _parse_pddl_from_text(self, text: str) -> Optional[PDDLGenerationResult]:
+        """
+        Attempt to extract DOMAIN and PROBLEM code blocks from LLM output.
+        Accepts variants like:
+           DOMAIN:
+           ```pddl
+           ...
+           ```
+           PROBLEM:
+           ```pddl
+           ...
+           ```
+        or plain blocks with 'DOMAIN:' and 'PROBLEM:' markers.
+        """
+        try:
+            # Try to find code fences first (```pddl ... ```)
+            domain_match = re.search(r"DOMAIN:\s*```pddl\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+            problem_match = re.search(r"PROBLEM:\s*```pddl\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+            if domain_match and problem_match:
+                domain = domain_match.group(1).strip()
+                problem = problem_match.group(1).strip()
+                reasoning_match = re.search(r"REASONING:\s*(.*?)(?=DOMAIN:|PROBLEM:|$)", text, re.DOTALL | re.IGNORECASE)
+                reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
+                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning=reasoning)
+
+            # Fallback: use 'DOMAIN:' and 'PROBLEM:' split without code fences
+            if "DOMAIN:" in text and "PROBLEM:" in text:
+                domain_part = text.split("DOMAIN:")[1].split("PROBLEM:")[0].strip()
+                problem_part = text.split("PROBLEM:")[1].strip()
+                # Remove surrounding backticks if present
+                domain = domain_part.strip("` \n")
+                problem = problem_part.strip("` \n")
+                reasoning_match = re.search(r"REASONING:\s*(.*?)(?=DOMAIN:|PROBLEM:|$)", text, re.DOTALL | re.IGNORECASE)
+                reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
+                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning=reasoning)
+
+            # Last resort: try finding parenthesis blocks typical of PDDL (heuristic)
+            domain_paren = re.search(r"\(define\s*\(domain.*?\)\)", text, re.DOTALL | re.IGNORECASE)
+            problem_paren = re.search(r"\(define\s*\(problem.*?\)\)", text, re.DOTALL | re.IGNORECASE)
+            if domain_paren and problem_paren:
+                domain = domain_paren.group(0).strip()
+                problem = problem_paren.group(0).strip()
+                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning="")
+        except Exception as e:
+            self.get_logger().error(f"Error extracting PDDL from text: {e}")
+        return None
+
+    def _run_fast_downward(self, domain_file: str, problem_file: str, timeout: int = 300) -> PlanningResult:
+        """
+        Call Fast Downward to produce a plan. Use FAST_DOWNWARD_PY if provided.
+        The plan is typically saved to 'sas_plan' in the working directory (or Fast Downward's dir).
+        We use the temp directory (same as domain/problem) for predictable output.
+        """
+        workdir = str(Path(domain_file).parent)
+        # If FAST_DOWNWARD_PY is an absolute/relative path; otherwise try to call installed fast-downward
+        cmd = ["python3", FAST_DOWNWARD_PY, domain_file, problem_file, "--search", "astar(lmcut())"]
+        self.get_logger().info(f"Calling Fast Downward: {' '.join(cmd)} (cwd={workdir})")
+        try:
+            result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=timeout)
             plan_text = ""
-            plan_path = Path("sas_plan")
-            if plan_path.exists():
-                plan_text = plan_path.read_text().strip()
-            return PlanningResult(
-                status="success" if result.returncode == 0 else "failed",
-                return_code=result.returncode,
-                stdout=result.stdout,
-                stderr=result.stderr,
-                plan=plan_text,
-                plan_length=len([
-                    line for line in plan_text.split("\n")
-                    if line.strip() and not line.startswith(";")
-                ])
-            )
+            sas_plan_path = Path(workdir) / "sas_plan"
+            if sas_plan_path.exists():
+                plan_text = sas_plan_path.read_text()
+            # Some Fast Downward variants print a plan to stdout if configured; prefer sas_plan
+            status = "success" if result.returncode == 0 else "failed"
+            return PlanningResult(status=status, return_code=result.returncode, stdout=result.stdout, stderr=result.stderr, plan=plan_text)
+        except subprocess.TimeoutExpired as e:
+            return PlanningResult(status="timeout", return_code=-1, stdout=str(e.stdout or ""), stderr=str(e.stderr or ""))
         except Exception as e:
             return PlanningResult(status="error", return_code=-1, stdout="", stderr=str(e))
 
-# --- Integration with existing agent node ---
-class AIAgentNode(Node):
-    def __init__(self):
-        super().__init__('ai_agent_node')
-        self.planner = PDDLPlanner(api_key=os.getenv("GEMINI_API_KEY"))
-        self.action_client = ActionClient(self, MediumLevelAction, '/medium_level')
-        self.task_sub = self.create_subscription(String, '/task_instruction', self.handle_instruction, 10)
+    def _parse_plan_text(self, plan_text: str) -> List[str]:
+        """
+        Parse plan text (sas_plan) into a list of textual steps.
+        Typical sas_plan lines look like:
+            (move robot a b) [1]
+        We'll strip parentheses, trailing costs, and return readable strings.
+        """
+        lines = []
+        for ln in plan_text.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            if ln.startswith(";"):  # comment lines
+                continue
+            # Remove cost annotations in brackets at line end, e.g. " [1]" or " (cost 1)"
+            ln = re.sub(r"\s*\[.*?\]\s*$", "", ln)
+            ln = re.sub(r"\s*\(cost.*?\)\s*$", "", ln, flags=re.IGNORECASE)
+            # Remove surrounding parentheses if present
+            if ln.startswith("(") and ln.endswith(")"):
+                ln = ln[1:-1].strip()
+            # Normalize whitespace and return
+            ln = " ".join(ln.split())
+            if ln:
+                lines.append(ln)
+        return lines
 
-    def handle_instruction(self, msg):
-        instruction = msg.data
-        self.get_logger().info(f"Received instruction: {instruction}")
+    # -----------------------
+    # Tools (LangChain wrappers)
+    # -----------------------
+    def _initialize_tools(self) -> List[BaseTool]:
+        tools: List[BaseTool] = []
 
-        # Step 1: Generate PDDL
-        pddl = self.planner.generate_pddl(instruction)
-        files = self.planner.save_pddl(pddl)
+        # Vision: detect_objects
+        @tool
+        def detect_objects(image_hint: Optional[str] = "") -> str:
+            """
+            Ask visual node to detect objects in the scene. 'image_hint' can help (e.g., "top view" or "rgb").
+            Returns a textual list of detected objects or an error message.
+            """
+            name = "detect_objects"
+            with self._tools_called_lock:
+                self._tools_called.append(name)
+            try:
+                if not self.vision_detect_client.wait_for_service(timeout_sec=2.0):
+                    return "Vision detect service unavailable"
+                req = SetBool.Request()
+                req.data = True
+                future = self.vision_detect_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+                resp = future.result()
+                return f"detect_objects response: {getattr(resp, 'message', str(resp))}"
+            except Exception as e:
+                return f"ERROR in detect_objects: {e}"
 
-        # Step 2: Run planner
-        result = self.planner.run_fast_downward(files["domain"], files["problem"])
-        if result.status != "success":
-            self.get_logger().error(f"Planning failed: {result.stderr}")
-            return
+        tools.append(detect_objects)
 
-        # Step 3: Execute steps via /medium_level
-        plan_steps = [
-            line.strip().lower()
-            for line in result.plan.split("\n")
-            if line and not line.startswith(";")
-        ]
+        @tool
+        def segment_object(object_name: str) -> str:
+            """
+            Request segmentation of a specific object (by name or hint). Returns segmentation result summary.
+            """
+            name = "segment_object"
+            with self._tools_called_lock:
+                self._tools_called.append(name)
+            try:
+                if not self.vision_segment_client.wait_for_service(timeout_sec=2.0):
+                    return "Vision segment service unavailable"
+                req = SetBool.Request()
+                req.data = True
+                future = self.vision_segment_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+                resp = future.result()
+                return f"segment_object response: {getattr(resp, 'message', str(resp))}"
+            except Exception as e:
+                return f"ERROR in segment_object: {e}"
 
-        for i, step in enumerate(plan_steps):
-            self.get_logger().info(f"Executing plan step {i+1}: {step}")
-            goal_msg = MediumLevel.Goal()
-            goal_msg.command = step
-            future = self.action_client.send_goal_async(goal_msg)
-            rclpy.spin_until_future_complete(self, future)
-            result_future = future.result().get_result_async()
-            rclpy.spin_until_future_complete(self, result_future)
+        tools.append(segment_object)
 
-        self.get_logger().info("Plan execution complete.")
+        @tool
+        def classify_region(region_hint: str) -> str:
+            """
+            Ask the vision node to classify a region or crop (e.g., 'red cup on left').
+            """
+            name = "classify_region"
+            with self._tools_called_lock:
+                self._tools_called.append(name)
+            try:
+                if not self.vision_classify_client.wait_for_service(timeout_sec=2.0):
+                    return "Vision classify service unavailable"
+                req = SetBool.Request()
+                req.data = True
+                future = self.vision_classify_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+                resp = future.result()
+                return f"classify_region response: {getattr(resp, 'message', str(resp))}"
+            except Exception as e:
+                return f"ERROR in classify_region: {e}"
+
+        tools.append(classify_region)
+
+        @tool
+        def get_depth_at_pixel(x: int, y: int) -> str:
+            """
+            Query depth camera for depth at pixel (x,y). Returns depth in meters or an error string.
+            """
+            name = "get_depth_at_pixel"
+            with self._tools_called_lock:
+                self._tools_called.append(name)
+            try:
+                if not self.vision_depth_client.wait_for_service(timeout_sec=2.0):
+                    return "Depth service unavailable"
+                req = SetBool.Request()
+                req.data = True
+                future = self.vision_depth_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+                resp = future.result()
+                return f"depth_at_pixel response: {getattr(resp, 'message', str(resp))}"
+            except Exception as e:
+                return f"ERROR in get_depth_at_pixel: {e}"
+
+        tools.append(get_depth_at_pixel)
+
+        # Tool to dispatch a step to medium-level planner, waits for completion
+        @tool
+        def send_to_medium_level(step_text: str, wait_for_result: bool = True) -> str:
+            """
+            Send a single textual step to the medium-level planner (/medium_level action server, Prompt action).
+            If wait_for_result is True, we wait for the medium-level response and return a short summary.
+            """
+            name = "send_to_medium_level"
+            with self._tools_called_lock:
+                self._tools_called.append(name)
+            try:
+                if not self.medium_level_client.wait_for_server(timeout_sec=5.0):
+                    return "Medium-level action server /medium_level unavailable"
+                goal = Prompt.Goal()
+                goal.prompt = step_text
+                send_future = self.medium_level_client.send_goal_async(goal)
+                rclpy.spin_until_future_complete(self, send_future)
+                goal_handle = send_future.result()
+                if not goal_handle.accepted:
+                    return "Medium-level goal rejected"
+                if wait_for_result:
+                    result_future = goal_handle.get_result_async()
+                    rclpy.spin_until_future_complete(self, result_future)
+                    res = result_future.result().result
+                    return f"medium_level result: success={res.success}, response={res.final_response}"
+                else:
+                    return "Sent step to medium_level (not waiting for result)."
+            except Exception as e:
+                return f"ERROR in send_to_medium_level: {e}"
+
+        tools.append(send_to_medium_level)
+
+        return tools
+
+    # -----------------------
+    # Create PDDL-generating agent
+    # -----------------------
+    def _create_pddl_agent_executor(self) -> AgentExecutor:
+        """
+        Create an agent whose job is to generate valid PDDL domain/problem given
+        a natural language instruction and optionally using the vision tools.
+        """
+        system_message = (
+            "You are a PDDL expert and ROS2 high-level planner. You have tools to inspect the scene "
+            "(detect_objects, segment_object, classify_region, get_depth_at_pixel) and a tool "
+            "to dispatch steps to the medium-level planner. "
+            "Given a high-level instruction, produce two valid PDDL files: DOMAIN and PROBLEM. "
+            "Be explicit about predicates and actions, and ensure the problem uses those predicates. "
+            "Format strictly using code fences and labels, for example:\n\n"
+            "REASONING:\n[explain your assumptions]\n\nDOMAIN:\n```pddl\n[domain content]\n```\n\n"
+            "PROBLEM:\n```pddl\n[problem content]\n```\n\n"
+            "If you need to inspect the scene, call the vision tools before producing PDDL. "
+            "Keep PDDL syntactically correct and avoid extraneous commentary inside the code fences."
+        )
+
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", system_message),
+                MessagesPlaceholder(variable_name="chat_history", optional=True),
+                ("human", "{input}"),
+                MessagesPlaceholder(variable_name="agent_scratchpad"),
+            ]
+        )
+
+        agent = create_tool_calling_agent(self.llm, self.tools, prompt)
+        return AgentExecutor(agent=agent, tools=self.tools, verbose=True, max_iterations=12)
+
+    # -----------------------
+    # Action server callbacks (high-level)
+    # -----------------------
+    def goal_callback(self, goal_request) -> GoalResponse:
+        self.get_logger().info(f"[high-level action] Received goal: {getattr(goal_request, 'prompt', '')}")
+        with self._tools_called_lock:
+            self._tools_called = []
+        return GoalResponse.ACCEPT
+
+    def cancel_callback(self, goal_handle) -> CancelResponse:
+        self.get_logger().info("[high-level action] Cancel request received.")
+        return CancelResponse.ACCEPT
+
+    async def execute_callback(self, goal_handle):
+        """
+        Execute incoming high-level Prompt action by running the PDDL pipeline.
+        Publishes periodic feedback with tools called.
+        """
+        prompt_text = goal_handle.request.prompt
+        self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
+
+        feedback_msg = Prompt.Feedback()
+        result_container: Dict[str, Any] = {"success": False, "final_response": ""}
+
+        def run_pipeline():
+            try:
+                # Reuse the transcript pipeline for core logic
+                self._plan_and_dispatch_from_transcript(prompt_text)
+                result_container["success"] = True
+                result_container["final_response"] = "PDDL planning + dispatch finished (or aborted)."
+            except Exception as e:
+                self.get_logger().error(f"Exception in action pipeline: {e}")
+                result_container["success"] = False
+                result_container["final_response"] = f"Error: {e}"
+
+        thread = threading.Thread(target=run_pipeline, daemon=True)
+        thread.start()
+
+        # Publish periodic feedback
+        while thread.is_alive():
+            with self._tools_called_lock:
+                tools_snapshot = list(self._tools_called)
+            feedback_msg.tools_called = tools_snapshot
+            try:
+                goal_handle.publish_feedback(feedback_msg)
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        # final feedback
+        with self._tools_called_lock:
+            tools_snapshot = list(self._tools_called)
+        feedback_msg.tools_called = tools_snapshot
+        try:
+            goal_handle.publish_feedback(feedback_msg)
+        except Exception:
+            pass
+
+        result_msg = Prompt.Result()
+        result_msg.success = bool(result_container.get("success", False))
+        result_msg.final_response = str(result_container.get("final_response", ""))
+
+        goal_handle.succeed()
+        self.get_logger().info(f"[high-level action] Goal finished. success={result_msg.success}")
+        return result_msg
+
+    # -----------------------
+    # Helpers: send step and return result object
+    # -----------------------
+    def send_step_to_medium(self, step_text: str, timeout: float = 60.0) -> Optional[Prompt.Result]:
+        """
+        Synchronous helper: sends a step to the /medium_level Prompt action server and waits for the result.
+        """
+        try:
+            if not self.medium_level_client.wait_for_server(timeout_sec=5.0):
+                self.get_logger().error("/medium_level action server unavailable")
+                return None
+            goal = Prompt.Goal()
+            goal.prompt = step_text
+            send_future = self.medium_level_client.send_goal_async(goal)
+            rclpy.spin_until_future_complete(self, send_future)
+            goal_handle = send_future.result()
+            if not goal_handle.accepted:
+                self.get_logger().error("Medium-level goal rejected")
+                return None
+            result_future = goal_handle.get_result_async()
+            rclpy.spin_until_future_complete(self, result_future, timeout_sec=timeout)
+            result = result_future.result().result
+            return result
+        except Exception as e:
+            self.get_logger().error(f"Exception when sending to medium: {e}")
+            return None
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = Ros2HighLevelAgentNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("Shutting down Ros2 High-Level Agent Node (PDDL).")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

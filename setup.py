@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'pddl_planner_node = high_level_pddl_planner.pddl_planner_node:main'
+            'pddl_planner_node = high_level_pddl_planner.high_level_pddl_planner:main'
         ],
     },
 )
