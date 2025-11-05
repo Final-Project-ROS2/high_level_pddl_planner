@@ -436,7 +436,7 @@ class Ros2HighLevelAgentNode(Node):
             except Exception as e:
                 return f"ERROR in send_to_medium_level: {e}"
 
-        tools.append(send_to_medium_level)
+        # tools.append(send_to_medium_level)
 
         return tools
 
@@ -449,29 +449,28 @@ class Ros2HighLevelAgentNode(Node):
         a natural language instruction and optionally using the vision tools.
         """
         system_message = (
-            "You are a PDDL expert and ROS2 high-level planner. You have tools to inspect the scene "
-            "(detect_objects, segment_object, classify_region, get_depth_at_pixel) and a tool "
-            "to dispatch steps to the medium-level planner. "
-            "Given a high-level instruction, produce two valid PDDL files: DOMAIN and PROBLEM. "
-            "Be explicit about predicates and actions, and ensure the problem uses those predicates. "
-            "Format strictly using code fences and labels, for example:\n\n"
-            "REASONING:\n[explain your assumptions]\n\nDOMAIN:\n```pddl\n[domain content]\n```\n\n"
-            "PROBLEM:\n```pddl\n[problem content]\n```\n\n"
-            "If you need to inspect the scene, call the vision tools before producing PDDL. "
-            "Keep PDDL syntactically correct and avoid extraneous commentary inside the code fences."
+            "You are a PDDL domain and problem generator for a robot planning system.\n"
+            "You have access to tools for *scene understanding only* "
+            "(detect_objects, segment_object, classify_region, get_depth_at_pixel).\n"
+            "You are strictly prohibited from calling any execution or control tools "
+            "like send_to_medium_level.\n\n"
+            "Your only task is to produce two valid PDDL files, one for DOMAIN and one for PROBLEM, "
+            "that together describe how the robot should solve the given task.\n\n"
+            "Follow this format exactly:\n"
+            "REASONING:\n[explain assumptions]\n\n"
+            "DOMAIN:\n```pddl\n[domain content]\n```\n\n"
+            "PROBLEM:\n```pddl\n[problem content]\n```\n"
         )
 
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", system_message),
-                MessagesPlaceholder(variable_name="chat_history", optional=True),
-                ("human", "{input}"),
-                MessagesPlaceholder(variable_name="agent_scratchpad"),
-            ]
-        )
-
-        agent = create_tool_calling_agent(self.llm, self.tools, prompt)
-        return AgentExecutor(agent=agent, tools=self.tools, verbose=True, max_iterations=12)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_message),
+            MessagesPlaceholder(variable_name="chat_history", optional=True),
+            ("human", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ])
+        return AgentExecutor(agent=create_tool_calling_agent(self.llm, self.tools, prompt),
+                            tools=self.tools,
+                            verbose=True)
 
     # -----------------------
     # Action server callbacks (high-level)
