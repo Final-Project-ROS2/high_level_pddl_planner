@@ -40,7 +40,8 @@ ENV_PATH = '/home/group11/final_project_ws/src/high_level_pddl_planner/.env'
 load_dotenv(dotenv_path=ENV_PATH)
 
 # Fast Downward path: set FAST_DOWNWARD_PY env or default
-FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", "./fast-downward/fast-downward.py")
+FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", "./fastdownward/fast-downward.py")
+SAS_PATH_PLAN = "/home/group11/final_project_ws/src/high_level_pddl_planner/sas_plan"
 
 
 class PDDLGenerationResult:
@@ -269,12 +270,15 @@ class Ros2HighLevelAgentNode(Node):
         workdir = str(Path(domain_file).parent)
         # If FAST_DOWNWARD_PY is an absolute/relative path; otherwise try to call installed fast-downward
         cmd = ["python3", FAST_DOWNWARD_PY, domain_file, problem_file, "--search", "astar(lmcut())"]
-        self.get_logger().info(f"Calling Fast Downward: {' '.join(cmd)} (cwd={workdir})")
+        self.get_logger().info(f"Calling Fast Downward: {' '.join(cmd)} (workdir={workdir})")
         try:
             result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=timeout)
             plan_text = ""
             sas_plan_path = Path(workdir) / "sas_plan"
+            self.get_logger().info(f"Fast Downward stdout:\n{result.stdout}")
+            self.get_logger().info(f"Plan file path: {sas_plan_path}")
             if sas_plan_path.exists():
+                self.get_logger().info("Plan file found, reading...")
                 plan_text = sas_plan_path.read_text()
             # Some Fast Downward variants print a plan to stdout if configured; prefer sas_plan
             status = "success" if result.returncode == 0 else "failed"

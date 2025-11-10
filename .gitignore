@@ -29,3 +29,5 @@ build/
 
 # Other common ignores
 .DS_Store
+
+fastdownward/
