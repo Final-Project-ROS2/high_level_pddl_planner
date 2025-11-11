@@ -143,7 +143,8 @@ class Ros2HighLevelAgentNode(Node):
 
         try:
             self.get_logger().info("PDDL pipeline: requesting PDDL generation from agent...")
-            self.response_pub.publish(String(data="Analyzing scene and generating PDDL..."))
+            self.response_pub.publish(String(data="Hey there! I'm thinking about how to handle your request"))
+            self.response_pub.publish(String(data="Analyzing scene and generating PDDL files"))
 
             # Prepare input: embed instruction plus minimal context placeholder
             # (If you want, you can first call detect_objects or other vision tools here and
@@ -151,13 +152,13 @@ class Ros2HighLevelAgentNode(Node):
             agent_resp = self.agent_executor.invoke({"input": instruction_text})
             final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
             self.get_logger().info(f"Agent output (raw):\n{final_text}")
-            self.response_pub.publish(String(data="LLM produced PDDL text — parsing..."))
+            self.response_pub.publish(String(data="I'm generating the PDDL files now"))
 
             # Extract domain and problem from the LLM output
             pddl_gen = self._parse_pddl_from_text(final_text)
             if pddl_gen is None:
                 self.get_logger().error("Failed to parse PDDL domain/problem from LLM output.")
-                self.response_pub.publish(String(data="Failed to extract PDDL. Try again or adjust prompt."))
+                self.response_pub.publish(String(data="I failed to extract PDDL. Try again or adjust prompt."))
                 return
 
             # Save PDDL to temporary directory
@@ -171,11 +172,11 @@ class Ros2HighLevelAgentNode(Node):
             self.get_logger().debug(f"Problem:\n{pddl_gen.problem_pddl}")
 
             # Run Fast Downward
-            self.response_pub.publish(String(data="Solving with Fast Downward..."))
+            self.response_pub.publish(String(data="I'm solving the PDDL problem using Fast Downward"))
             plan_result = self._run_fast_downward(str(domain_path), str(problem_path))
             if plan_result.status != "success" or not plan_result.plan.strip():
                 self.get_logger().warn(f"Planner returned no plan. status={plan_result.status} rc={plan_result.return_code}")
-                self.response_pub.publish(String(data=f"PDDL solver failed or found no plan. stderr: {plan_result.stderr[:200]}"))
+                self.response_pub.publish(String(data=f"I couldn't find a plan."))
                 return
 
             self.get_logger().info("Plan obtained from Fast Downward. Parsing to steps...")
@@ -185,7 +186,7 @@ class Ros2HighLevelAgentNode(Node):
                 self.response_pub.publish(String(data="No actionable steps parsed from plan."))
                 return
 
-            self.response_pub.publish(String(data=f"Plan found with {len(plan_lines)} steps. Executing..."))
+            self.response_pub.publish(String(data=f"Plan found with {len(plan_lines)} steps. Executing"))
             # Dispatch steps to medium_level
             for i, step in enumerate(plan_lines, start=1):
                 start_msg = f"Executing plan step {i}/{len(plan_lines)}: {step}"
@@ -205,7 +206,7 @@ class Ros2HighLevelAgentNode(Node):
                     self.response_pub.publish(String(data=ok_msg))
                     self.get_logger().info(ok_msg)
 
-            self.response_pub.publish(String(data="Plan execution finished (or aborted)."))
+            self.response_pub.publish(String(data="Plan execution finished."))
 
         except Exception as e:
             self.get_logger().error(f"Exception in PDDL planning pipeline: {e}")
@@ -460,6 +461,8 @@ class Ros2HighLevelAgentNode(Node):
             "like send_to_medium_level.\n\n"
             "Your only task is to produce two valid PDDL files, one for DOMAIN and one for PROBLEM, "
             "that together describe how the robot should solve the given task.\n\n"
+            "Assume a simple robot with any capabilities necessary. "
+            "The PDDL file should be as simple as possible. \n"
             "Follow this format exactly:\n"
             "REASONING:\n[explain assumptions]\n\n"
             "DOMAIN:\n```pddl\n[domain content]\n```\n\n"
