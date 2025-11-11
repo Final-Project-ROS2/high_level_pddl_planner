@@ -20,7 +20,7 @@ from rclpy.node import Node
 from rclpy.action import ActionServer, ActionClient, CancelResponse, GoalResponse
 from rclpy.task import Future as RclpyFuture
 
-from std_srvs.srv import SetBool
+from std_srvs.srv import SetBool, Trigger
 from std_msgs.msg import String
 from geometry_msgs.msg import Pose
 
@@ -580,11 +580,10 @@ class Ros2HighLevelAgentNode(Node):
             "You are a PDDL domain and problem generator for a robot planning system.\n"
             "You have access to tools that query vision"
             "capabilities (detect_objects, classify_all, classify_bb, detect_grasp, detect_grasp_bb, understand_scene).\n"
-            "You are strictly prohibited from calling any execution or control tools "
-            "like send_to_medium_level.\n\n"
             "Your only task is to produce two valid PDDL files, one for DOMAIN and one for PROBLEM, "
             "that together describe how the robot should solve the given task.\n\n"
             "Assume a simple robot with any capabilities necessary. "
+            "Always assume that the robot initial state is not the same as the target state.\n"
             "The PDDL file should be as simple as possible. \n"
             "Follow this format exactly:\n"
             "REASONING:\n[explain assumptions]\n\n"
