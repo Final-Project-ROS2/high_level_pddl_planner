@@ -27,6 +27,15 @@ from geometry_msgs.msg import Pose
 # Action used for inter-level communication (Prompt action)
 from custom_interfaces.action import Prompt
 
+# Vision service types (assumes these exist in your workspace)
+from custom_interfaces.srv import (
+    DetectObjects,
+    ClassifyBBox,
+    DetectGrasps,
+    DetectGraspBBox,
+    UnderstandScene,
+)
+
 # LangChain LLM/agent imports
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -86,11 +95,13 @@ class Ros2HighLevelAgentNode(Node):
         # Medium-level action client
         self.medium_level_client = ActionClient(self, Prompt, "/medium_level")
 
-        # Vision service clients (placeholders, same as before)
-        self.vision_detect_client = self.create_client(SetBool, "/vision/detect_objects")
-        self.vision_segment_client = self.create_client(SetBool, "/vision/segment_object")
-        self.vision_classify_client = self.create_client(SetBool, "/vision/classify_region")
-        self.vision_depth_client = self.create_client(SetBool, "/vision/get_depth_at_pixel")
+        # Vision service clients - real types from your specification
+        self.vision_detect_objects_client = self.create_client(DetectObjects, "/vision/detect_objects")
+        self.vision_classify_all_client = self.create_client(Trigger, "/vision/classify_all")
+        self.vision_classify_bb_client = self.create_client(ClassifyBBox, "/vision/classify_bb")
+        self.vision_detect_grasp_client = self.create_client(DetectGrasps, "/vision/detect_grasp")
+        self.vision_detect_grasp_bb_client = self.create_client(DetectGraspBBox, "/vision/detect_grasp_bb")
+        self.vision_understand_scene_client = self.create_client(UnderstandScene, "/vision/understand_scene")
 
         # Track tools called
         self._tools_called: List[str] = []
@@ -321,95 +332,204 @@ class Ros2HighLevelAgentNode(Node):
     def _initialize_tools(self) -> List[BaseTool]:
         tools: List[BaseTool] = []
 
-        # Vision: detect_objects
         @tool
         def detect_objects(image_hint: Optional[str] = "") -> str:
             """
-            Ask visual node to detect objects in the scene. 'image_hint' can help (e.g., "top view" or "rgb").
-            Returns a textual list of detected objects or an error message.
+            Call /vision/detect_objects (DetectObjects.srv) which returns bounding boxes and meta info.
+            Returns a short textual summary with counts and first few bboxes.
             """
-            name = "detect_objects"
+            tool_name = "detect_objects"
             with self._tools_called_lock:
-                self._tools_called.append(name)
+                self._tools_called.append(tool_name)
+
             try:
-                if not self.vision_detect_client.wait_for_service(timeout_sec=2.0):
-                    return "Vision detect service unavailable"
-                req = SetBool.Request()
-                req.data = True
-                future = self.vision_detect_client.call_async(req)
-                rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+                if not self.vision_detect_objects_client.wait_for_service(timeout_sec=5.0):
+                    return "Service /vision/detect_objects unavailable"
+                req = DetectObjects.Request()
+                future = self.vision_detect_objects_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future)
                 resp = future.result()
-                return f"detect_objects response: {getattr(resp, 'message', str(resp))}"
+                if resp is None:
+                    return "No response from /vision/detect_objects"
+                if not resp.success:
+                    return f"detect_objects failed: {resp.error_message or 'unknown error'}"
+                total = int(resp.total_detections)
+                items = []
+                N = min(total, 4)
+                for i in range(N):
+                    oid = resp.object_ids[i] if i < len(resp.object_ids) else f"obj_{i}"
+                    x1 = resp.bbox_x1[i] if i < len(resp.bbox_x1) else -1
+                    y1 = resp.bbox_y1[i] if i < len(resp.bbox_y1) else -1
+                    x2 = resp.bbox_x2[i] if i < len(resp.bbox_x2) else -1
+                    y2 = resp.bbox_y2[i] if i < len(resp.bbox_y2) else -1
+                    conf = resp.confidences[i] if i < len(resp.confidences) else 0.0
+                    dist = resp.distances_cm[i] if i < len(resp.distances_cm) else -1.0
+                    items.append(f"{oid} bbox=[{x1},{y1},{x2},{y2}] conf={conf:.2f} dist_cm={dist:.1f}")
+                summary = f"Detected {total} objects. Examples: " + "; ".join(items) if items else f"Detected {total} objects."
+                return summary
             except Exception as e:
                 return f"ERROR in detect_objects: {e}"
 
         tools.append(detect_objects)
 
         @tool
-        def segment_object(object_name: str) -> str:
+        def classify_all() -> str:
             """
-            Request segmentation of a specific object (by name or hint). Returns segmentation result summary.
+            Trigger /vision/classify_all (std_srvs/Trigger) to classify entire frame or all detections.
             """
-            name = "segment_object"
+            tool_name = "classify_all"
             with self._tools_called_lock:
-                self._tools_called.append(name)
+                self._tools_called.append(tool_name)
             try:
-                if not self.vision_segment_client.wait_for_service(timeout_sec=2.0):
-                    return "Vision segment service unavailable"
-                req = SetBool.Request()
-                req.data = True
-                future = self.vision_segment_client.call_async(req)
-                rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+                if not self.vision_classify_all_client.wait_for_service(timeout_sec=5.0):
+                    return "Service /vision/classify_all unavailable"
+                req = Trigger.Request()
+                future = self.vision_classify_all_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future)
                 resp = future.result()
-                return f"segment_object response: {getattr(resp, 'message', str(resp))}"
+                if resp is None:
+                    return "No response from /vision/classify_all"
+                return f"classify_all: success={resp.success}, message={resp.message}"
             except Exception as e:
-                return f"ERROR in segment_object: {e}"
+                return f"ERROR in classify_all: {e}"
 
-        tools.append(segment_object)
+        tools.append(classify_all)
 
         @tool
-        def classify_region(region_hint: str) -> str:
+        def classify_bb(x1: int, y1: int, x2: int, y2: int) -> str:
             """
-            Ask the vision node to classify a region or crop (e.g., 'red cup on left').
+            Call /vision/classify_bb with bounding box coordinates.
+            Returns the top label + confidence and the raw 'all_predictions' JSON string (truncated).
             """
-            name = "classify_region"
+            tool_name = "classify_bb"
             with self._tools_called_lock:
-                self._tools_called.append(name)
+                self._tools_called.append(tool_name)
             try:
-                if not self.vision_classify_client.wait_for_service(timeout_sec=2.0):
-                    return "Vision classify service unavailable"
-                req = SetBool.Request()
-                req.data = True
-                future = self.vision_classify_client.call_async(req)
-                rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+                if not self.vision_classify_bb_client.wait_for_service(timeout_sec=5.0):
+                    return "Service /vision/classify_bb unavailable"
+                req = ClassifyBBox.Request()
+                req.x1 = int(x1)
+                req.y1 = int(y1)
+                req.x2 = int(x2)
+                req.y2 = int(y2)
+                future = self.vision_classify_bb_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future)
                 resp = future.result()
-                return f"classify_region response: {getattr(resp, 'message', str(resp))}"
+                if resp is None:
+                    return "No response from /vision/classify_bb"
+                if not resp.success:
+                    return f"classify_bb failed: {resp.all_predictions or 'error'}"
+                allpred = resp.all_predictions or ""
+                if len(allpred) > 400:
+                    allpred_trunc = allpred[:400] + "...(truncated)"
+                else:
+                    allpred_trunc = allpred
+                return f"classify_bb: label='{resp.label}', confidence={resp.confidence:.3f}, all_predictions={allpred_trunc}"
             except Exception as e:
-                return f"ERROR in classify_region: {e}"
+                return f"ERROR in classify_bb: {e}"
 
-        tools.append(classify_region)
+        tools.append(classify_bb)
 
         @tool
-        def get_depth_at_pixel(x: int, y: int) -> str:
+        def detect_grasp() -> str:
             """
-            Query depth camera for depth at pixel (x,y). Returns depth in meters or an error string.
+            Call /vision/detect_grasp to compute grasps for all detected objects.
+            Returns a short summary describing how many grasps were found and top qualities.
             """
-            name = "get_depth_at_pixel"
+            tool_name = "detect_grasp"
             with self._tools_called_lock:
-                self._tools_called.append(name)
+                self._tools_called.append(tool_name)
             try:
-                if not self.vision_depth_client.wait_for_service(timeout_sec=2.0):
-                    return "Depth service unavailable"
-                req = SetBool.Request()
-                req.data = True
-                future = self.vision_depth_client.call_async(req)
-                rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+                if not self.vision_detect_grasp_client.wait_for_service(timeout_sec=5.0):
+                    return "Service /vision/detect_grasp unavailable"
+                req = DetectGrasps.Request()
+                future = self.vision_detect_grasp_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future)
                 resp = future.result()
-                return f"depth_at_pixel response: {getattr(resp, 'message', str(resp))}"
+                if resp is None:
+                    return "No response from /vision/detect_grasp"
+                if not resp.success:
+                    return f"detect_grasp failed: {resp.error_message or 'unknown'}"
+                total = int(resp.total_grasps)
+                qualities = []
+                try:
+                    for i in range(min(3, len(resp.grasp_poses))):
+                        qualities.append(f"{resp.grasp_poses[i].quality_score:.3f}")
+                except Exception:
+                    pass
+                qual_summary = ", ".join(qualities) if qualities else "no quality info"
+                return f"detect_grasp: total_grasps={total}, sample_qualities=[{qual_summary}]"
             except Exception as e:
-                return f"ERROR in get_depth_at_pixel: {e}"
+                return f"ERROR in detect_grasp: {e}"
 
-        tools.append(get_depth_at_pixel)
+        tools.append(detect_grasp)
+
+        @tool
+        def detect_grasp_bb(x1: int, y1: int, x2: int, y2: int) -> str:
+            """
+            Call /vision/detect_grasp_bb to compute a single grasp pose for the specified bounding box.
+            Returns a compact textual description of the returned GraspPose.
+            """
+            tool_name = "detect_grasp_bb"
+            with self._tools_called_lock:
+                self._tools_called.append(tool_name)
+            try:
+                if not self.vision_detect_grasp_bb_client.wait_for_service(timeout_sec=5.0):
+                    return "Service /vision/detect_grasp_bb unavailable"
+                req = DetectGraspBBox.Request()
+                req.x1 = int(x1)
+                req.y1 = int(y1)
+                req.x2 = int(x2)
+                req.y2 = int(y2)
+                future = self.vision_detect_grasp_bb_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future)
+                resp = future.result()
+                if resp is None:
+                    return "No response from /vision/detect_grasp_bb"
+                if not resp.success:
+                    return f"detect_grasp_bb failed: {resp.error_message or 'unknown'}"
+                gp = resp.grasp_pose
+                pos = gp.position
+                ori = gp.orientation
+                return (f"grasp_bb: object_id={gp.object_id}, bbox={list(gp.bbox)}, "
+                        f"pos=({pos.x:.3f},{pos.y:.3f},{pos.z:.3f}), "
+                        f"ori=({ori.x:.3f},{ori.y:.3f},{ori.z:.3f},{ori.w:.3f}), "
+                        f"quality={gp.quality_score:.3f}, width={gp.width:.3f}, approach={gp.approach_direction}")
+            except Exception as e:
+                return f"ERROR in detect_grasp_bb: {e}"
+
+        tools.append(detect_grasp_bb)
+
+        @tool
+        def understand_scene() -> str:
+            """
+            Call /vision/understand_scene which returns a SceneUnderstanding message.
+            We extract a short natural-language summary and a few stats for the LLM.
+            """
+            tool_name = "understand_scene"
+            with self._tools_called_lock:
+                self._tools_called.append(tool_name)
+            try:
+                if not self.vision_understand_scene_client.wait_for_service(timeout_sec=5.0):
+                    return "Service /vision/understand_scene unavailable"
+                req = UnderstandScene.Request()
+                future = self.vision_understand_scene_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future)
+                resp = future.result()
+                if resp is None:
+                    return "No response from /vision/understand_scene"
+                if not resp.success:
+                    return f"understand_scene failed: {resp.error_message or 'unknown'}"
+                summary = getattr(resp.scene, "scene_description", None)
+                if summary:
+                    return f"scene_summary: {summary}"
+                total_objects = getattr(resp.scene, "total_objects", None)
+                labels = getattr(resp.scene, "object_labels", None)
+                return f"scene_summary: total_objects={total_objects}, labels={labels}"
+            except Exception as e:
+                return f"ERROR in understand_scene: {e}"
+
+        tools.append(understand_scene)
 
         # Tool to dispatch a step to medium-level planner, waits for completion
         @tool
@@ -455,8 +575,8 @@ class Ros2HighLevelAgentNode(Node):
         """
         system_message = (
             "You are a PDDL domain and problem generator for a robot planning system.\n"
-            "You have access to tools for *scene understanding only* "
-            "(detect_objects, segment_object, classify_region, get_depth_at_pixel).\n"
+            "You have access to tools that query vision"
+            "capabilities (detect_objects, classify_all, classify_bb, detect_grasp, detect_grasp_bb, understand_scene).\n"
             "You are strictly prohibited from calling any execution or control tools "
             "like send_to_medium_level.\n\n"
             "Your only task is to produce two valid PDDL files, one for DOMAIN and one for PROBLEM, "
