@@ -44,6 +44,8 @@ from langchain.agents import AgentExecutor, create_tool_calling_agent
 
 from dotenv import load_dotenv
 
+import time
+
 # Load env
 ENV_PATH = '/home/group11/final_project_ws/src/high_level_pddl_planner/.env'
 load_dotenv(dotenv_path=ENV_PATH)
@@ -123,6 +125,7 @@ class Ros2HighLevelAgentNode(Node):
 
         # Response publisher
         self.response_pub = self.create_publisher(String, "/response", 10)
+        self.benchmark_pub = self.create_publisher(String, "/benchmark_logs", 10)
 
         self.get_logger().info("Ros2 High-Level Agent Node (PDDL) ready.")
 
@@ -617,6 +620,7 @@ class Ros2HighLevelAgentNode(Node):
         Execute incoming high-level Prompt action by running the PDDL pipeline.
         Publishes periodic feedback with tools called.
         """
+        start_time = time.perf_counter()
         prompt_text = goal_handle.request.prompt
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
 
@@ -663,6 +667,9 @@ class Ros2HighLevelAgentNode(Node):
 
         goal_handle.succeed()
         self.get_logger().info(f"[high-level action] Goal finished. success={result_msg.success}")
+        end_time = time.perf_counter()
+        benchmark_info = f"High-level action completed in {end_time - start_time:.2f} seconds.\n Number of tools called: {len(tools_snapshot)}"
+        self.benchmark_pub.publish(String(data=benchmark_info))
         return result_msg
 
     # -----------------------
