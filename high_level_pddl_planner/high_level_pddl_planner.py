@@ -202,25 +202,25 @@ class Ros2HighLevelAgentNode(Node):
 
             self.response_pub.publish(String(data=f"Plan found with {len(plan_lines)} steps. Executing"))
             # Dispatch steps to medium_level
-            for i, step in enumerate(plan_lines, start=1):
-                start_msg = f"Executing plan step {i}/{len(plan_lines)}: {step}"
-                self.response_pub.publish(String(data=start_msg))
-                self.get_logger().info(start_msg)
-                result = self.send_step_to_medium(step)
-                if result is None:
-                    err_msg = f"Failed to send step {i}. Aborting."
-                    self.response_pub.publish(String(data=err_msg))
-                    self.get_logger().error(err_msg)
-                    break
-                else:
-                    if result.success:
-                        ok_msg = f"Step {i} finished successfully: {result.final_response}"
-                    else:
-                        ok_msg = f"Step {i} executed but reported failure: {result.final_response}"
-                    self.response_pub.publish(String(data=ok_msg))
-                    self.get_logger().info(ok_msg)
+            # for i, step in enumerate(plan_lines, start=1):
+            #     start_msg = f"Executing plan step {i}/{len(plan_lines)}: {step}"
+            #     self.response_pub.publish(String(data=start_msg))
+            #     self.get_logger().info(start_msg)
+            #     result = self.send_step_to_medium(step)
+            #     if result is None:
+            #         err_msg = f"Failed to send step {i}. Aborting."
+            #         self.response_pub.publish(String(data=err_msg))
+            #         self.get_logger().error(err_msg)
+            #         break
+            #     else:
+            #         if result.success:
+            #             ok_msg = f"Step {i} finished successfully: {result.final_response}"
+            #         else:
+            #             ok_msg = f"Step {i} executed but reported failure: {result.final_response}"
+            #         self.response_pub.publish(String(data=ok_msg))
+            #         self.get_logger().info(ok_msg)
 
-            self.response_pub.publish(String(data="Plan execution finished."))
+            # self.response_pub.publish(String(data="Plan execution finished."))
 
         except Exception as e:
             self.get_logger().error(f"Exception in PDDL planning pipeline: {e}")
@@ -533,38 +533,6 @@ class Ros2HighLevelAgentNode(Node):
                 return f"ERROR in understand_scene: {e}"
 
         tools.append(understand_scene)
-
-        # Tool to dispatch a step to medium-level planner, waits for completion
-        @tool
-        def send_to_medium_level(step_text: str, wait_for_result: bool = True) -> str:
-            """
-            Send a single textual step to the medium-level planner (/medium_level action server, Prompt action).
-            If wait_for_result is True, we wait for the medium-level response and return a short summary.
-            """
-            name = "send_to_medium_level"
-            with self._tools_called_lock:
-                self._tools_called.append(name)
-            try:
-                if not self.medium_level_client.wait_for_server(timeout_sec=5.0):
-                    return "Medium-level action server /medium_level unavailable"
-                goal = Prompt.Goal()
-                goal.prompt = step_text
-                send_future = self.medium_level_client.send_goal_async(goal)
-                rclpy.spin_until_future_complete(self, send_future)
-                goal_handle = send_future.result()
-                if not goal_handle.accepted:
-                    return "Medium-level goal rejected"
-                if wait_for_result:
-                    result_future = goal_handle.get_result_async()
-                    rclpy.spin_until_future_complete(self, result_future)
-                    res = result_future.result().result
-                    return f"medium_level result: success={res.success}, response={res.final_response}"
-                else:
-                    return "Sent step to medium_level (not waiting for result)."
-            except Exception as e:
-                return f"ERROR in send_to_medium_level: {e}"
-
-        # tools.append(send_to_medium_level)
 
         return tools
 
