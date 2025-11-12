@@ -1,10 +1,13 @@
 """
-ROS2 High-Level Agent Node (PDDL-based)
+ROS2 High-Level Agent Node (PDDL-based) - Enhanced Version
 
 Replaces the previous "LLM -> direct steps" workflow with:
 LLM (with vision tools) -> generate PDDL domain & problem -> run Fast Downward -> parse plan -> dispatch steps to /medium_level
 
-Keep your vision services & medium-level action server available.
+Features:
+- Chat history management
+- /confirm service for plan approval
+- Plan logging to /response topic
 """
 import os
 import re
@@ -41,10 +44,9 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool, tool
 from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.messages import HumanMessage, AIMessage
 
 from dotenv import load_dotenv
-
-import time
 
 # Load env
 ENV_PATH = '/home/group11/final_project_ws/src/high_level_pddl_planner/.env'
@@ -86,7 +88,7 @@ class Ros2HighLevelAgentNode(Node):
             self.get_logger().warn("No LLM API key found in environment variable GEMINI_API_KEY.")
 
         # Configure LLM; temperature 0 to favor deterministic outputs for PDDL
-        self.llm = ChatGoogleGenerativeAI(model=os.getenv("LLM_MODEL", "gemini-2.5-flash"),
+        self.llm = ChatGoogleGenerativeAI(model=os.getenv("LLM_MODEL", "gemini-2.0-flash"),
                                           google_api_key=api_key, temperature=0.0)
 
         # Transcript subscription
@@ -112,6 +114,16 @@ class Ros2HighLevelAgentNode(Node):
         # Initialize LangChain tools and agent
         self.tools = self._initialize_tools()
         self.agent_executor = self._create_pddl_agent_executor()
+
+        # Chat history
+        self.chat_history: List[Dict[str, str]] = []  # [{'role': 'user', 'content': ...}, {'role': 'assistant', 'content': ...}]
+        self.latest_plan: Optional[List[str]] = None
+
+        # Store PDDL generation results for reference
+        self.latest_pddl: Optional[PDDLGenerationResult] = None
+
+        # Create confirmation service
+        self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
 
         # High-level action server (Prompt action)
         self._action_server = ActionServer(
@@ -139,41 +151,57 @@ class Ros2HighLevelAgentNode(Node):
         with self._last_transcript_lock:
             self._last_transcript = text
         self.get_logger().info(f"Received transcript: {text}")
-        plan_thread = threading.Thread(target=self._plan_and_dispatch_from_transcript, args=(text,), daemon=True)
+        plan_thread = threading.Thread(target=self._generate_plan, args=(text,), daemon=True)
         plan_thread.start()
 
-    def _plan_and_dispatch_from_transcript(self, instruction_text: str):
+    def _generate_plan(self, instruction_text: str) -> List[str]:
         """
-        Full pipeline:
-         - Reset tools_called
-         - Ask agent (LLM) to generate PDDL domain & problem (agent may call vision tools)
-         - Save files to temp dir
-         - Run Fast Downward
-         - Parse plan -> list of textual steps
-         - Dispatch steps to /medium_level synchronously
+        Generate a plan (PDDL domain/problem -> Fast Downward -> parsed steps) but do NOT execute.
+        The plan is stored internally for later confirmation.
         """
+        # Add user message to chat history
+        self.chat_history.append({"role": "user", "content": instruction_text})
+
         with self._tools_called_lock:
             self._tools_called = []
 
         try:
-            self.get_logger().info("PDDL pipeline: requesting PDDL generation from agent...")
-            self.response_pub.publish(String(data="Hey there! I'm thinking about how to handle your request"))
+            self.get_logger().info("High-level agent (PDDL): thinking and generating plan...")
+            self.response_pub.publish(String(data="Got it! Let me think through that..."))
             self.response_pub.publish(String(data="Analyzing scene and generating PDDL files"))
 
-            # Prepare input: embed instruction plus minimal context placeholder
-            # (If you want, you can first call detect_objects or other vision tools here and
-            # include their outputs in the input string. Agent can also call tools itself.)
-            agent_resp = self.agent_executor.invoke({"input": instruction_text})
+            # Build LangChain chat history
+            langchain_history = []
+            for msg in self.chat_history[:-1]:  # Exclude the current message we just added
+                if msg["role"] == "user":
+                    langchain_history.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant":
+                    langchain_history.append(AIMessage(content=msg["content"]))
+
+            # Invoke agent with chat history
+            agent_resp = self.agent_executor.invoke({
+                "input": instruction_text,
+                "chat_history": langchain_history
+            })
+
             final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
             self.get_logger().info(f"Agent output (raw):\n{final_text}")
+
+            # Add AI response to chat history
+            self.chat_history.append({"role": "assistant", "content": final_text})
+
             self.response_pub.publish(String(data="I'm generating the PDDL files now"))
 
             # Extract domain and problem from the LLM output
             pddl_gen = self._parse_pddl_from_text(final_text)
             if pddl_gen is None:
+                msg = "Hmm... I couldn't generate valid PDDL files. Could you try rephrasing that?"
                 self.get_logger().error("Failed to parse PDDL domain/problem from LLM output.")
-                self.response_pub.publish(String(data="I failed to extract PDDL. Try again or adjust prompt."))
-                return
+                self.response_pub.publish(String(data=msg))
+                return []
+
+            # Store PDDL for reference
+            self.latest_pddl = pddl_gen
 
             # Save PDDL to temporary directory
             tmpdir = tempfile.mkdtemp(prefix="pddl_")
@@ -189,42 +217,79 @@ class Ros2HighLevelAgentNode(Node):
             self.response_pub.publish(String(data="I'm solving the PDDL problem using Fast Downward"))
             plan_result = self._run_fast_downward(str(domain_path), str(problem_path))
             if plan_result.status != "success" or not plan_result.plan.strip():
+                msg = f"I couldn't find a valid plan. The planner returned: {plan_result.status}"
                 self.get_logger().warn(f"Planner returned no plan. status={plan_result.status} rc={plan_result.return_code}")
-                self.response_pub.publish(String(data=f"I couldn't find a plan."))
-                return
+                self.response_pub.publish(String(data=msg))
+                return []
 
             self.get_logger().info("Plan obtained from Fast Downward. Parsing to steps...")
             plan_lines = self._parse_plan_text(plan_result.plan)
             if not plan_lines:
+                msg = "No actionable steps could be parsed from the plan."
                 self.get_logger().warn("No actionable plan lines parsed.")
-                self.response_pub.publish(String(data="No actionable steps parsed from plan."))
-                return
+                self.response_pub.publish(String(data=msg))
+                return []
 
-            self.response_pub.publish(String(data=f"Plan found with {len(plan_lines)} steps. Executing"))
-            # Dispatch steps to medium_level
-            for i, step in enumerate(plan_lines, start=1):
-                start_msg = f"Executing plan step {i}/{len(plan_lines)}: {step}"
-                self.response_pub.publish(String(data=start_msg))
-                self.get_logger().info(start_msg)
-                result = self.send_step_to_medium(step)
-                if result is None:
-                    err_msg = f"Failed to send step {i}. Aborting."
-                    self.response_pub.publish(String(data=err_msg))
-                    self.get_logger().error(err_msg)
-                    break
-                else:
-                    if result.success:
-                        ok_msg = f"Step {i} finished successfully: {result.final_response}"
-                    else:
-                        ok_msg = f"Step {i} executed but reported failure: {result.final_response}"
-                    self.response_pub.publish(String(data=ok_msg))
-                    self.get_logger().info(ok_msg)
+            # Store the plan
+            self.latest_plan = plan_lines
 
-            self.response_pub.publish(String(data="Plan execution finished."))
+            # Present plan to user for confirmation
+            readable_plan = "\n".join([f"{i+1}. {s}" for i, s in enumerate(plan_lines)])
+            self.response_pub.publish(String(
+                data=f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and confirm if this looks good!"
+            ))
+            self.get_logger().info(f"Generated plan with {len(plan_lines)} steps, waiting for /confirm.")
+            return plan_lines
 
         except Exception as e:
-            self.get_logger().error(f"Exception in PDDL planning pipeline: {e}")
-            self.response_pub.publish(String(data=f"Planning error: {e}"))
+            self.get_logger().error(f"Error generating plan: {e}")
+            self.response_pub.publish(String(data="Sorry, something went wrong while planning."))
+            return []
+
+    def confirm_service_callback(self, request, response):
+        """
+        When the user confirms, execute the latest plan step-by-step.
+        Clears chat history and latest plan after execution.
+        """
+        if not self.latest_plan:
+            response.success = False
+            response.message = "No plan to confirm. Please give a new instruction first."
+            self.response_pub.publish(String(data=response.message))
+            return response
+
+        # Execute the plan in a separate thread to avoid blocking the service callback
+        def execute_plan():
+            self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
+            self.get_logger().info("Executing confirmed plan...")
+
+            for i, step in enumerate(self.latest_plan, start=1):
+                self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
+                result = self.send_step_to_medium_async(step)
+
+                if result is None or not result.success:
+                    msg = f"Step {i} failed: {step}. Stopping execution."
+                    self.response_pub.publish(String(data=msg))
+                    self.get_logger().error(msg)
+                    break
+                else:
+                    done_msg = f"Step {i} completed successfully."
+                    self.response_pub.publish(String(data=done_msg))
+                    self.get_logger().info(done_msg)
+
+            self.response_pub.publish(String(data="Plan execution finished."))
+            self.get_logger().info("All steps done. Clearing chat history and plan.")
+            self.chat_history.clear()
+            self.latest_plan = None
+            self.latest_pddl = None
+
+        # Start execution in background thread
+        execution_thread = threading.Thread(target=execute_plan, daemon=True)
+        execution_thread.start()
+
+        # Return immediately from service call
+        response.success = True
+        response.message = "Plan execution started."
+        return response
 
     # -----------------------
     # PDDL parsing & Fast Downward helpers
@@ -232,16 +297,6 @@ class Ros2HighLevelAgentNode(Node):
     def _parse_pddl_from_text(self, text: str) -> Optional[PDDLGenerationResult]:
         """
         Attempt to extract DOMAIN and PROBLEM code blocks from LLM output.
-        Accepts variants like:
-           DOMAIN:
-           ```pddl
-           ...
-           ```
-           PROBLEM:
-           ```pddl
-           ...
-           ```
-        or plain blocks with 'DOMAIN:' and 'PROBLEM:' markers.
         """
         try:
             # Try to find code fences first (```pddl ... ```)
@@ -278,12 +333,9 @@ class Ros2HighLevelAgentNode(Node):
 
     def _run_fast_downward(self, domain_file: str, problem_file: str, timeout: int = 300) -> PlanningResult:
         """
-        Call Fast Downward to produce a plan. Use FAST_DOWNWARD_PY if provided.
-        The plan is typically saved to 'sas_plan' in the working directory (or Fast Downward's dir).
-        We use the temp directory (same as domain/problem) for predictable output.
+        Call Fast Downward to produce a plan.
         """
         workdir = str(Path(domain_file).parent)
-        # If FAST_DOWNWARD_PY is an absolute/relative path; otherwise try to call installed fast-downward
         cmd = ["python3", FAST_DOWNWARD_PY, domain_file, problem_file, "--search", "astar(lmcut())"]
         self.get_logger().info(f"Calling Fast Downward: {' '.join(cmd)} (workdir={workdir})")
         try:
@@ -295,7 +347,6 @@ class Ros2HighLevelAgentNode(Node):
             if sas_plan_path.exists():
                 self.get_logger().info("Plan file found, reading...")
                 plan_text = sas_plan_path.read_text()
-            # Some Fast Downward variants print a plan to stdout if configured; prefer sas_plan
             status = "success" if result.returncode == 0 else "failed"
             return PlanningResult(status=status, return_code=result.returncode, stdout=result.stdout, stderr=result.stderr, plan=plan_text)
         except subprocess.TimeoutExpired as e:
@@ -306,9 +357,6 @@ class Ros2HighLevelAgentNode(Node):
     def _parse_plan_text(self, plan_text: str) -> List[str]:
         """
         Parse plan text (sas_plan) into a list of textual steps.
-        Typical sas_plan lines look like:
-            (move robot a b) [1]
-        We'll strip parentheses, trailing costs, and return readable strings.
         """
         lines = []
         for ln in plan_text.splitlines():
@@ -317,7 +365,7 @@ class Ros2HighLevelAgentNode(Node):
                 continue
             if ln.startswith(";"):  # comment lines
                 continue
-            # Remove cost annotations in brackets at line end, e.g. " [1]" or " (cost 1)"
+            # Remove cost annotations in brackets at line end
             ln = re.sub(r"\s*\[.*?\]\s*$", "", ln)
             ln = re.sub(r"\s*\(cost.*?\)\s*$", "", ln, flags=re.IGNORECASE)
             # Remove surrounding parentheses if present
@@ -534,38 +582,6 @@ class Ros2HighLevelAgentNode(Node):
 
         tools.append(understand_scene)
 
-        # Tool to dispatch a step to medium-level planner, waits for completion
-        @tool
-        def send_to_medium_level(step_text: str, wait_for_result: bool = True) -> str:
-            """
-            Send a single textual step to the medium-level planner (/medium_level action server, Prompt action).
-            If wait_for_result is True, we wait for the medium-level response and return a short summary.
-            """
-            name = "send_to_medium_level"
-            with self._tools_called_lock:
-                self._tools_called.append(name)
-            try:
-                if not self.medium_level_client.wait_for_server(timeout_sec=5.0):
-                    return "Medium-level action server /medium_level unavailable"
-                goal = Prompt.Goal()
-                goal.prompt = step_text
-                send_future = self.medium_level_client.send_goal_async(goal)
-                rclpy.spin_until_future_complete(self, send_future)
-                goal_handle = send_future.result()
-                if not goal_handle.accepted:
-                    return "Medium-level goal rejected"
-                if wait_for_result:
-                    result_future = goal_handle.get_result_async()
-                    rclpy.spin_until_future_complete(self, result_future)
-                    res = result_future.result().result
-                    return f"medium_level result: success={res.success}, response={res.final_response}"
-                else:
-                    return "Sent step to medium_level (not waiting for result)."
-            except Exception as e:
-                return f"ERROR in send_to_medium_level: {e}"
-
-        # tools.append(send_to_medium_level)
-
         return tools
 
     # -----------------------
@@ -597,9 +613,8 @@ class Ros2HighLevelAgentNode(Node):
             ("human", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
-        return AgentExecutor(agent=create_tool_calling_agent(self.llm, self.tools, prompt),
-                            tools=self.tools,
-                            verbose=True)
+        agent = create_tool_calling_agent(self.llm, self.tools, prompt)
+        return AgentExecutor(agent=agent, tools=self.tools, verbose=True, max_iterations=12)
 
     # -----------------------
     # Action server callbacks (high-level)
@@ -628,10 +643,25 @@ class Ros2HighLevelAgentNode(Node):
 
         def run_pipeline():
             try:
-                # Reuse the transcript pipeline for core logic
-                self._plan_and_dispatch_from_transcript(prompt_text)
+                goal_text = goal_handle.request.prompt.strip()
+                if not goal_text:
+                    result_container["success"] = False
+                    result_container["final_response"] = "Empty prompt"
+                    return
+
+                self.get_logger().info(f"High-level Prompt action received: {goal_text}")
+
+                # Generate plan but do not execute
+                steps = self._generate_plan(goal_text)
+                if not steps:
+                    result_container["success"] = False
+                    result_container["final_response"] = "Failed to generate plan"
+                    return
+
+                # Wait for confirmation
+                msg = f"Generated {len(steps)} step(s). Please review and confirm via /confirm to execute."
                 result_container["success"] = True
-                result_container["final_response"] = "PDDL planning + dispatch finished (or aborted)."
+                result_container["final_response"] = msg
             except Exception as e:
                 self.get_logger().error(f"Exception in action pipeline: {e}")
                 result_container["success"] = False
@@ -694,6 +724,64 @@ class Ros2HighLevelAgentNode(Node):
             rclpy.spin_until_future_complete(self, result_future, timeout_sec=timeout)
             result = result_future.result().result
             return result
+        except Exception as e:
+            self.get_logger().error(f"Exception when sending to medium: {e}")
+            return None
+
+    def send_step_to_medium_async(self, step_text: str, timeout: float = 60.0) -> Optional[Prompt.Result]:
+        """
+        Thread-safe version that uses threading.Event instead of spin_until_future_complete.
+        """
+        try:
+            if not self.medium_level_client.wait_for_server(timeout_sec=5.0):
+                self.get_logger().error("/medium_level action server unavailable")
+                return None
+            
+            goal = Prompt.Goal()
+            goal.prompt = step_text
+            
+            # Use events to wait for async operations
+            goal_event = threading.Event()
+            result_event = threading.Event()
+            goal_handle_container = [None]
+            result_container = [None]
+            
+            # Callback for goal response
+            def goal_response_callback(future):
+                goal_handle_container[0] = future.result()
+                goal_event.set()
+            
+            # Callback for result
+            def result_callback(future):
+                result_container[0] = future.result()
+                result_event.set()
+            
+            # Send goal
+            send_future = self.medium_level_client.send_goal_async(goal)
+            send_future.add_done_callback(goal_response_callback)
+            
+            # Wait for goal acceptance
+            if not goal_event.wait(timeout=5.0):
+                self.get_logger().error("Timeout waiting for goal acceptance")
+                return None
+            
+            goal_handle = goal_handle_container[0]
+            if not goal_handle.accepted:
+                self.get_logger().error("Medium-level goal rejected")
+                return None
+            
+            # Get result
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(result_callback)
+            
+            # Wait for result
+            if not result_event.wait(timeout=timeout):
+                self.get_logger().error("Timeout waiting for result")
+                return None
+            
+            result = result_container[0].result
+            return result
+            
         except Exception as e:
             self.get_logger().error(f"Exception when sending to medium: {e}")
             return None
