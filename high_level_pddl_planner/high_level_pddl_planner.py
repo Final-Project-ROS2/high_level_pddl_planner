@@ -553,67 +553,45 @@ Current Robot State:
     # Create PDDL agent
     # -----------------------
     def _create_pddl_agent_executor(self) -> AgentExecutor:
-<<<<<<< HEAD
         """Create an agent that generates PDDL domain and problem files."""
         system_message = f"""You are a PDDL domain and problem generator for a robot planning system.
 
-You have access to vision tools to understand the scene (detect_objects, classify_all, understand_scene).
-The current robot state will be provided in the user message.
+        You have access to vision tools to understand the scene (detect_objects, classify_all, understand_scene).
+        The current robot state will be provided in the user message.
 
-Below is a TEMPLATE DOMAIN with predefined actions. You should use this as a starting point:
+        Below is a TEMPLATE DOMAIN with predefined actions. You should use this as a starting point:
 
-{FIXED_DOMAIN}
+        {FIXED_DOMAIN}
 
-Your task is to:
-1. Review the template domain above
-2. Modify it ONLY if absolutely necessary (e.g., if you need additional predicates, types, or action parameters)
-3. Generate a corresponding PROBLEM file with:
-   - Object definitions (include directions: left, right, up, down, forward, backward as direction objects)
-   - Initial state based on the provided current robot state
-   - Goal state that achieves the user's instruction
+        Your task is to:
+        1. Review the template domain above
+        2. Modify it ONLY if absolutely necessary (e.g., if you need additional predicates, types, or action parameters)
+        3. Generate a corresponding PROBLEM file with:
+        - Object definitions (include directions: left, right, up, down, forward, backward as direction objects)
+        - Initial state based on the provided current robot state
+        - Goal state that achieves the user's instruction
 
-IMPORTANT GUIDELINES:
-- Prefer using the template domain as-is whenever possible
-- Only modify the domain if the task genuinely requires additional capabilities
-- If you modify the domain, explain why in your reasoning
-- Always ensure domain and problem are compatible
-- Keep modifications minimal and focused
+        IMPORTANT GUIDELINES:
+        - Prefer using the template domain as-is whenever possible
+        - Only modify the domain if the task genuinely requires additional capabilities
+        - If you modify the domain, explain why in your reasoning
+        - Always ensure domain and problem are compatible
+        - Keep modifications minimal and focused
 
-Follow this format exactly:
-REASONING:
-[Explain your approach and any domain modifications]
+        Follow this format exactly:
+        REASONING:
+        [Explain your approach and any domain modifications]
 
-DOMAIN:
-```pddl
-[domain content - use template or modified version]
-```
+        DOMAIN:
+        ```pddl
+        [domain content - use template or modified version]
+        ```
 
-PROBLEM:
-```pddl
-[problem content]
-```
-"""
-=======
+        PROBLEM:
+        ```pddl
+        [problem content]
+        ```
         """
-        Create an agent whose job is to generate valid PDDL domain/problem given
-        a natural language instruction and optionally using the vision tools.
-        """
-        system_message = (
-            "You are a PDDL domain and problem generator for a robot planning system.\n"
-            "You have access to tools that query vision"
-            "capabilities (detect_objects, classify_all, classify_bb, detect_grasp, detect_grasp_bb, understand_scene).\n"
-            "Your only task is to produce two valid PDDL files, one for DOMAIN and one for PROBLEM, "
-            "that together describe how the robot should solve the given task.\n\n"
-            "Assume a simple robot with any capabilities necessary. "
-            "Always assume that the robot initial state is not the same as the target state.\n"
-            "**ALWAYS** generate PDDL files no matter the given instruction, even if the instruction seems trivial.\n"
-            "The PDDL file should be as simple as possible. \n"
-            "Follow this format exactly:\n"
-            "REASONING:\n[explain assumptions]\n\n"
-            "DOMAIN:\n```pddl\n[domain content]\n```\n\n"
-            "PROBLEM:\n```pddl\n[problem content]\n```\n"
-        )
->>>>>>> main
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_message),
