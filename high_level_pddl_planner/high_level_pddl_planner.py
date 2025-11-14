@@ -600,6 +600,7 @@ class Ros2HighLevelAgentNode(Node):
             "that together describe how the robot should solve the given task.\n\n"
             "Assume a simple robot with any capabilities necessary. "
             "Always assume that the robot initial state is not the same as the target state.\n"
+            "**ALWAYS** generate PDDL files no matter the given instruction, even if the instruction seems trivial.\n"
             "The PDDL file should be as simple as possible. \n"
             "Follow this format exactly:\n"
             "REASONING:\n[explain assumptions]\n\n"
