@@ -553,6 +553,7 @@ Current Robot State:
     # Create PDDL agent
     # -----------------------
     def _create_pddl_agent_executor(self) -> AgentExecutor:
+<<<<<<< HEAD
         """Create an agent that generates PDDL domain and problem files."""
         system_message = f"""You are a PDDL domain and problem generator for a robot planning system.
 
@@ -592,6 +593,27 @@ PROBLEM:
 [problem content]
 ```
 """
+=======
+        """
+        Create an agent whose job is to generate valid PDDL domain/problem given
+        a natural language instruction and optionally using the vision tools.
+        """
+        system_message = (
+            "You are a PDDL domain and problem generator for a robot planning system.\n"
+            "You have access to tools that query vision"
+            "capabilities (detect_objects, classify_all, classify_bb, detect_grasp, detect_grasp_bb, understand_scene).\n"
+            "Your only task is to produce two valid PDDL files, one for DOMAIN and one for PROBLEM, "
+            "that together describe how the robot should solve the given task.\n\n"
+            "Assume a simple robot with any capabilities necessary. "
+            "Always assume that the robot initial state is not the same as the target state.\n"
+            "**ALWAYS** generate PDDL files no matter the given instruction, even if the instruction seems trivial.\n"
+            "The PDDL file should be as simple as possible. \n"
+            "Follow this format exactly:\n"
+            "REASONING:\n[explain assumptions]\n\n"
+            "DOMAIN:\n```pddl\n[domain content]\n```\n\n"
+            "PROBLEM:\n```pddl\n[problem content]\n```\n"
+        )
+>>>>>>> main
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_message),
