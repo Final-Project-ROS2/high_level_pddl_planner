@@ -286,16 +286,17 @@ Current Robot State:
 
             self.response_pub.publish(String(data="Generating PDDL problem file"))
 
-            # Parse only the PROBLEM from LLM output
-            problem_pddl = self._parse_problem_from_text(final_text)
-            if problem_pddl is None:
-                msg = "Hmm... I couldn't generate a valid PDDL problem. Could you try rephrasing that?"
-                self.get_logger().error("Failed to parse PDDL problem from LLM output.")
+            # Parse DOMAIN and PROBLEM from LLM output
+            pddl_gen = self._parse_domain_and_problem_from_text(final_text)
+            if pddl_gen is None:
+                msg = "Hmm... I couldn't generate valid PDDL files. Could you try rephrasing that?"
+                self.get_logger().error("Failed to parse PDDL domain/problem from LLM output.")
                 self.response_pub.publish(String(data=msg))
                 return []
 
-            # Use fixed domain
-            domain_pddl = FIXED_DOMAIN
+            # Use LLM-generated domain (which may be modified from the template)
+            domain_pddl = pddl_gen.domain_pddl
+            problem_pddl = pddl_gen.problem_pddl
             
             # Store PDDL for reference
             self.latest_pddl = PDDLGenerationResult(domain_pddl=domain_pddl, problem_pddl=problem_pddl)
@@ -552,25 +553,45 @@ Current Robot State:
     # Create PDDL agent
     # -----------------------
     def _create_pddl_agent_executor(self) -> AgentExecutor:
-        """Create an agent that generates PDDL problems only."""
-        system_message = (
-            "You are a PDDL problem generator for a robot planning system.\n"
-            "The DOMAIN is FIXED and includes these actions:\n"
-            "- move_to_home: no preconditions, makes robot at home\n"
-            "- move_to_ready: requires robot at home, moves robot to ready position\n"
-            "- open_gripper: requires gripper closed, opens gripper\n"
-            "- close_gripper: requires gripper open, closes gripper\n"
-            "- move_to_direction: takes a direction parameter (left/right/up/down/forward/backward)\n\n"
-            "You have access to vision tools to understand the scene.\n"
-            "The current robot state is provided in the user message.\n\n"
-            "Your ONLY task is to generate a valid PDDL PROBLEM file that:\n"
-            "1. Defines objects (including directions: left, right, up, down, forward, backward)\n"
-            "2. Sets the initial state based on the provided current state\n"
-            "3. Defines the goal state that achieves the user's instruction\n\n"
-            "Follow this format exactly:\n"
-            "REASONING:\n[explain your approach]\n\n"
-            "PROBLEM:\n```pddl\n[problem content]\n```\n"
-        )
+        """Create an agent that generates PDDL domain and problem files."""
+        system_message = f"""You are a PDDL domain and problem generator for a robot planning system.
+
+You have access to vision tools to understand the scene (detect_objects, classify_all, understand_scene).
+The current robot state will be provided in the user message.
+
+Below is a TEMPLATE DOMAIN with predefined actions. You should use this as a starting point:
+
+{FIXED_DOMAIN}
+
+Your task is to:
+1. Review the template domain above
+2. Modify it ONLY if absolutely necessary (e.g., if you need additional predicates, types, or action parameters)
+3. Generate a corresponding PROBLEM file with:
+   - Object definitions (include directions: left, right, up, down, forward, backward as direction objects)
+   - Initial state based on the provided current robot state
+   - Goal state that achieves the user's instruction
+
+IMPORTANT GUIDELINES:
+- Prefer using the template domain as-is whenever possible
+- Only modify the domain if the task genuinely requires additional capabilities
+- If you modify the domain, explain why in your reasoning
+- Always ensure domain and problem are compatible
+- Keep modifications minimal and focused
+
+Follow this format exactly:
+REASONING:
+[Explain your approach and any domain modifications]
+
+DOMAIN:
+```pddl
+[domain content - use template or modified version]
+```
+
+PROBLEM:
+```pddl
+[problem content]
+```
+"""
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_message),
