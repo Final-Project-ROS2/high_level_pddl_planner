@@ -1,13 +1,8 @@
 """
-ROS2 High-Level Agent Node (PDDL-based) - Enhanced Version
+ROS2 High-Level Agent Node (PDDL-based) - Fixed Domain Version
 
-Replaces the previous "LLM -> direct steps" workflow with:
-LLM (with vision tools) -> generate PDDL domain & problem -> run Fast Downward -> parse plan -> dispatch steps to /medium_level
-
-Features:
-- Chat history management
-- /confirm service for plan approval
-- Plan logging to /response topic
+Modified to use a fixed PDDL domain with predetermined actions,
+while generating the problem file dynamically based on runtime state queries.
 """
 import os
 import re
@@ -27,19 +22,16 @@ from std_srvs.srv import SetBool, Trigger
 from std_msgs.msg import String
 from geometry_msgs.msg import Pose
 
-# Action used for inter-level communication (Prompt action)
 from custom_interfaces.action import Prompt
-
-# Vision service types (assumes these exist in your workspace)
 from custom_interfaces.srv import (
     DetectObjects,
     ClassifyBBox,
     DetectGrasps,
     DetectGraspBBox,
     UnderstandScene,
+    GetSetBool,
 )
 
-# LangChain LLM/agent imports
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool, tool
@@ -48,13 +40,66 @@ from langchain_core.messages import HumanMessage, AIMessage
 
 from dotenv import load_dotenv
 
-# Load env
 ENV_PATH = '/home/group11/final_project_ws/src/high_level_pddl_planner/.env'
 load_dotenv(dotenv_path=ENV_PATH)
 
-# Fast Downward path: set FAST_DOWNWARD_PY env or default
 FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", "./fastdownward/fast-downward.py")
 SAS_PATH_PLAN = "/home/group11/final_project_ws/src/high_level_pddl_planner/sas_plan"
+
+# Fixed PDDL Domain
+FIXED_DOMAIN = """(define (domain robot-manipulation)
+  (:requirements :strips :typing)
+  
+  (:types
+    location direction
+  )
+  
+  (:predicates
+    (robot-at ?loc - location)
+    (gripper-open)
+    (gripper-closed)
+  )
+  
+  (:action move_to_home
+    :parameters ()
+    :precondition (and)
+    :effect (robot-at home)
+  )
+  
+  (:action move_to_ready
+    :parameters ()
+    :precondition (robot-at home)
+    :effect (and
+      (robot-at ready)
+      (not (robot-at home))
+    )
+  )
+  
+  (:action open_gripper
+    :parameters ()
+    :precondition (gripper-closed)
+    :effect (and
+      (gripper-open)
+      (not (gripper-closed))
+    )
+  )
+  
+  (:action close_gripper
+    :parameters ()
+    :precondition (gripper-open)
+    :effect (and
+      (gripper-closed)
+      (not (gripper-open))
+    )
+  )
+  
+  (:action move_to_direction
+    :parameters (?dir - direction)
+    :precondition (and)
+    :effect (and)
+  )
+)
+"""
 
 
 class PDDLGenerationResult:
@@ -77,17 +122,15 @@ class PlanningResult:
 class Ros2HighLevelAgentNode(Node):
     def __init__(self):
         super().__init__("ros2_high_level_agent_pddl")
-        self.get_logger().info("Initializing Ros2 High-Level Agent Node (PDDL mode)...")
+        self.get_logger().info("Initializing Ros2 High-Level Agent Node (Fixed PDDL Domain)...")
 
         self.declare_parameter("real_hardware", False)
         self.real_hardware: bool = self.get_parameter("real_hardware").get_parameter_value().bool_value
 
-        # LLM init (Gemini or configured model)
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             self.get_logger().warn("No LLM API key found in environment variable GEMINI_API_KEY.")
 
-        # Configure LLM; temperature 0 to favor deterministic outputs for PDDL
         self.llm = ChatGoogleGenerativeAI(model=os.getenv("LLM_MODEL", "gemini-2.0-flash"),
                                           google_api_key=api_key, temperature=0.0)
 
@@ -99,7 +142,7 @@ class Ros2HighLevelAgentNode(Node):
         # Medium-level action client
         self.medium_level_client = ActionClient(self, Prompt, "/medium_level")
 
-        # Vision service clients - real types from your specification
+        # Vision service clients
         self.vision_detect_objects_client = self.create_client(DetectObjects, "/vision/detect_objects")
         self.vision_classify_all_client = self.create_client(Trigger, "/vision/classify_all")
         self.vision_classify_bb_client = self.create_client(ClassifyBBox, "/vision/classify_bb")
@@ -107,25 +150,23 @@ class Ros2HighLevelAgentNode(Node):
         self.vision_detect_grasp_bb_client = self.create_client(DetectGraspBBox, "/vision/detect_grasp_bb")
         self.vision_understand_scene_client = self.create_client(UnderstandScene, "/vision/understand_scene")
 
-        # Track tools called
+        # State query service clients
+        self.is_home_client = self.create_client(GetSetBool, "/is_home")
+        self.is_ready_client = self.create_client(GetSetBool, "/is_ready")
+        self.gripper_is_open_client = self.create_client(GetSetBool, "/gripper_is_open")
+
         self._tools_called: List[str] = []
         self._tools_called_lock = threading.Lock()
 
-        # Initialize LangChain tools and agent
         self.tools = self._initialize_tools()
         self.agent_executor = self._create_pddl_agent_executor()
 
-        # Chat history
-        self.chat_history: List[Dict[str, str]] = []  # [{'role': 'user', 'content': ...}, {'role': 'assistant', 'content': ...}]
+        self.chat_history: List[Dict[str, str]] = []
         self.latest_plan: Optional[List[str]] = None
-
-        # Store PDDL generation results for reference
         self.latest_pddl: Optional[PDDLGenerationResult] = None
 
-        # Create confirmation service
         self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
 
-        # High-level action server (Prompt action)
         self._action_server = ActionServer(
             self,
             Prompt,
@@ -135,11 +176,54 @@ class Ros2HighLevelAgentNode(Node):
             cancel_callback=self.cancel_callback,
         )
 
-        # Response publisher
         self.response_pub = self.create_publisher(String, "/response", 10)
         self.benchmark_pub = self.create_publisher(String, "/benchmark_logs", 10)
 
-        self.get_logger().info("Ros2 High-Level Agent Node (PDDL) ready.")
+        self.get_logger().info("Ros2 High-Level Agent Node (Fixed PDDL Domain) ready.")
+
+    # -----------------------
+    # State query helpers
+    # -----------------------
+    def _query_state(self, client, service_name: str) -> Optional[bool]:
+        """Query a state service and return the current value."""
+        try:
+            if not client.wait_for_service(timeout_sec=3.0):
+                self.get_logger().warn(f"Service {service_name} unavailable")
+                return None
+            
+            req = GetSetBool.Request()
+            req.set = False  # Just query, don't set
+            req.value = False
+            
+            future = client.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
+            
+            resp = future.result()
+            if resp is None or not resp.success:
+                self.get_logger().warn(f"Failed to query {service_name}")
+                return None
+            
+            return resp.value
+        except Exception as e:
+            self.get_logger().error(f"Error querying {service_name}: {e}")
+            return None
+
+    def _get_current_state(self) -> Dict[str, bool]:
+        """Query all state services and return current state."""
+        state = {}
+        
+        is_home = self._query_state(self.is_home_client, "/is_home")
+        is_ready = self._query_state(self.is_ready_client, "/is_ready")
+        gripper_open = self._query_state(self.gripper_is_open_client, "/gripper_is_open")
+        
+        # Default to reasonable values if services fail
+        state['robot_at_home'] = is_home if is_home is not None else False
+        state['robot_at_ready'] = is_ready if is_ready is not None else False
+        state['gripper_open'] = gripper_open if gripper_open is not None else True
+        state['gripper_closed'] = not state['gripper_open']
+        
+        self.get_logger().info(f"Current state: {state}")
+        return state
 
     # -----------------------
     # Transcript handling
@@ -155,66 +239,80 @@ class Ros2HighLevelAgentNode(Node):
         plan_thread.start()
 
     def _generate_plan(self, instruction_text: str) -> List[str]:
-        """
-        Generate a plan (PDDL domain/problem -> Fast Downward -> parsed steps) but do NOT execute.
-        The plan is stored internally for later confirmation.
-        """
-        # Add user message to chat history
+        """Generate a plan using fixed domain and dynamic problem generation."""
         self.chat_history.append({"role": "user", "content": instruction_text})
 
         with self._tools_called_lock:
             self._tools_called = []
 
         try:
-            self.get_logger().info("High-level agent (PDDL): thinking and generating plan...")
+            self.get_logger().info("High-level agent (PDDL): generating plan with fixed domain...")
             self.response_pub.publish(String(data="Got it! Let me think through that..."))
-            self.response_pub.publish(String(data="Analyzing scene and generating PDDL files"))
+            self.response_pub.publish(String(data="Analyzing scene and determining current state"))
+
+            # Get current state from services
+            current_state = self._get_current_state()
+            
+            # Build state description for LLM
+            state_description = f"""
+Current Robot State:
+- Robot at home: {current_state['robot_at_home']}
+- Robot at ready: {current_state['robot_at_ready']}
+- Gripper open: {current_state['gripper_open']}
+- Gripper closed: {current_state['gripper_closed']}
+"""
 
             # Build LangChain chat history
             langchain_history = []
-            for msg in self.chat_history[:-1]:  # Exclude the current message we just added
+            for msg in self.chat_history[:-1]:
                 if msg["role"] == "user":
                     langchain_history.append(HumanMessage(content=msg["content"]))
                 elif msg["role"] == "assistant":
                     langchain_history.append(AIMessage(content=msg["content"]))
 
-            # Invoke agent with chat history
+            # Create augmented instruction with state info
+            augmented_instruction = f"{instruction_text}\n\n{state_description}"
+
+            # Invoke agent
             agent_resp = self.agent_executor.invoke({
-                "input": instruction_text,
+                "input": augmented_instruction,
                 "chat_history": langchain_history
             })
 
             final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
             self.get_logger().info(f"Agent output (raw):\n{final_text}")
 
-            # Add AI response to chat history
             self.chat_history.append({"role": "assistant", "content": final_text})
 
-            self.response_pub.publish(String(data="I'm generating the PDDL files now"))
+            self.response_pub.publish(String(data="Generating PDDL problem file"))
 
-            # Extract domain and problem from the LLM output
-            pddl_gen = self._parse_pddl_from_text(final_text)
+            # Parse DOMAIN and PROBLEM from LLM output
+            pddl_gen = self._parse_domain_and_problem_from_text(final_text)
             if pddl_gen is None:
                 msg = "Hmm... I couldn't generate valid PDDL files. Could you try rephrasing that?"
                 self.get_logger().error("Failed to parse PDDL domain/problem from LLM output.")
                 self.response_pub.publish(String(data=msg))
                 return []
 
+            # Use LLM-generated domain (which may be modified from the template)
+            domain_pddl = pddl_gen.domain_pddl
+            problem_pddl = pddl_gen.problem_pddl
+            
             # Store PDDL for reference
-            self.latest_pddl = pddl_gen
+            self.latest_pddl = PDDLGenerationResult(domain_pddl=domain_pddl, problem_pddl=problem_pddl)
 
             # Save PDDL to temporary directory
             tmpdir = tempfile.mkdtemp(prefix="pddl_")
             domain_path = Path(tmpdir) / "domain.pddl"
             problem_path = Path(tmpdir) / "problem.pddl"
-            domain_path.write_text(pddl_gen.domain_pddl)
-            problem_path.write_text(pddl_gen.problem_pddl)
+            domain_path.write_text(domain_pddl)
+            problem_path.write_text(problem_pddl)
             self.get_logger().info(f"PDDL files saved to {tmpdir}")
-            self.get_logger().debug(f"Domain:\n{pddl_gen.domain_pddl}")
-            self.get_logger().debug(f"Problem:\n{pddl_gen.problem_pddl}")
+            self.get_logger().debug(f"Domain:\n{domain_pddl}")
+            self.get_logger().debug(f"Problem:\n{problem_pddl}")
 
             # Run Fast Downward
-            self.response_pub.publish(String(data="I'm solving the PDDL problem using Fast Downward"))
+            self.response_pub.publish(String(data="Solving the PDDL problem using Fast Downward"))
             plan_result = self._run_fast_downward(str(domain_path), str(problem_path))
             if plan_result.status != "success" or not plan_result.plan.strip():
                 msg = f"I couldn't find a valid plan. The planner returned: {plan_result.status}"
@@ -230,10 +328,8 @@ class Ros2HighLevelAgentNode(Node):
                 self.response_pub.publish(String(data=msg))
                 return []
 
-            # Store the plan
             self.latest_plan = plan_lines
 
-            # Present plan to user for confirmation
             readable_plan = "\n".join([f"{i+1}. {s}" for i, s in enumerate(plan_lines)])
             self.response_pub.publish(String(
                 data=f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and confirm if this looks good!"
@@ -247,17 +343,13 @@ class Ros2HighLevelAgentNode(Node):
             return []
 
     def confirm_service_callback(self, request, response):
-        """
-        When the user confirms, execute the latest plan step-by-step.
-        Clears chat history and latest plan after execution.
-        """
+        """Execute the latest plan when confirmed."""
         if not self.latest_plan:
             response.success = False
             response.message = "No plan to confirm. Please give a new instruction first."
             self.response_pub.publish(String(data=response.message))
             return response
 
-        # Execute the plan in a separate thread to avoid blocking the service callback
         def execute_plan():
             self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
             self.get_logger().info("Executing confirmed plan...")
@@ -282,26 +374,23 @@ class Ros2HighLevelAgentNode(Node):
             self.latest_plan = None
             self.latest_pddl = None
 
-        # Start execution in background thread
         execution_thread = threading.Thread(target=execute_plan, daemon=True)
         execution_thread.start()
 
-        # Return immediately from service call
         response.success = True
         response.message = "Plan execution started."
         return response
 
     # -----------------------
-    # PDDL parsing & Fast Downward helpers
+    # PDDL parsing helpers
     # -----------------------
-    def _parse_pddl_from_text(self, text: str) -> Optional[PDDLGenerationResult]:
-        """
-        Attempt to extract DOMAIN and PROBLEM code blocks from LLM output.
-        """
+    def _parse_domain_and_problem_from_text(self, text: str) -> Optional[PDDLGenerationResult]:
+        """Extract DOMAIN and PROBLEM PDDL from LLM output."""
         try:
-            # Try to find code fences first (```pddl ... ```)
+            # Try code fence format first
             domain_match = re.search(r"DOMAIN:\s*```pddl\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
             problem_match = re.search(r"PROBLEM:\s*```pddl\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+            
             if domain_match and problem_match:
                 domain = domain_match.group(1).strip()
                 problem = problem_match.group(1).strip()
@@ -309,32 +398,30 @@ class Ros2HighLevelAgentNode(Node):
                 reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
                 return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning=reasoning)
 
-            # Fallback: use 'DOMAIN:' and 'PROBLEM:' split without code fences
+            # Try simple split
             if "DOMAIN:" in text and "PROBLEM:" in text:
                 domain_part = text.split("DOMAIN:")[1].split("PROBLEM:")[0].strip()
                 problem_part = text.split("PROBLEM:")[1].strip()
-                # Remove surrounding backticks if present
                 domain = domain_part.strip("` \n")
                 problem = problem_part.strip("` \n")
                 reasoning_match = re.search(r"REASONING:\s*(.*?)(?=DOMAIN:|PROBLEM:|$)", text, re.DOTALL | re.IGNORECASE)
                 reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
                 return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning=reasoning)
 
-            # Last resort: try finding parenthesis blocks typical of PDDL (heuristic)
+            # Try finding define blocks
             domain_paren = re.search(r"\(define\s*\(domain.*?\)\)", text, re.DOTALL | re.IGNORECASE)
             problem_paren = re.search(r"\(define\s*\(problem.*?\)\)", text, re.DOTALL | re.IGNORECASE)
             if domain_paren and problem_paren:
                 domain = domain_paren.group(0).strip()
                 problem = problem_paren.group(0).strip()
                 return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning="")
+                
         except Exception as e:
             self.get_logger().error(f"Error extracting PDDL from text: {e}")
         return None
 
     def _run_fast_downward(self, domain_file: str, problem_file: str, timeout: int = 300) -> PlanningResult:
-        """
-        Call Fast Downward to produce a plan.
-        """
+        """Call Fast Downward to produce a plan."""
         workdir = str(Path(domain_file).parent)
         cmd = ["python3", FAST_DOWNWARD_PY, domain_file, problem_file, "--search", "astar(lmcut())"]
         self.get_logger().info(f"Calling Fast Downward: {' '.join(cmd)} (workdir={workdir})")
@@ -343,9 +430,7 @@ class Ros2HighLevelAgentNode(Node):
             plan_text = ""
             sas_plan_path = Path(workdir) / "sas_plan"
             self.get_logger().info(f"Fast Downward stdout:\n{result.stdout}")
-            self.get_logger().info(f"Plan file path: {sas_plan_path}")
             if sas_plan_path.exists():
-                self.get_logger().info("Plan file found, reading...")
                 plan_text = sas_plan_path.read_text()
             status = "success" if result.returncode == 0 else "failed"
             return PlanningResult(status=status, return_code=result.returncode, stdout=result.stdout, stderr=result.stderr, plan=plan_text)
@@ -355,40 +440,30 @@ class Ros2HighLevelAgentNode(Node):
             return PlanningResult(status="error", return_code=-1, stdout="", stderr=str(e))
 
     def _parse_plan_text(self, plan_text: str) -> List[str]:
-        """
-        Parse plan text (sas_plan) into a list of textual steps.
-        """
+        """Parse plan text into textual steps."""
         lines = []
         for ln in plan_text.splitlines():
             ln = ln.strip()
-            if not ln:
+            if not ln or ln.startswith(";"):
                 continue
-            if ln.startswith(";"):  # comment lines
-                continue
-            # Remove cost annotations in brackets at line end
             ln = re.sub(r"\s*\[.*?\]\s*$", "", ln)
             ln = re.sub(r"\s*\(cost.*?\)\s*$", "", ln, flags=re.IGNORECASE)
-            # Remove surrounding parentheses if present
             if ln.startswith("(") and ln.endswith(")"):
                 ln = ln[1:-1].strip()
-            # Normalize whitespace and return
             ln = " ".join(ln.split())
             if ln:
                 lines.append(ln)
         return lines
 
     # -----------------------
-    # Tools (LangChain wrappers)
+    # Tools
     # -----------------------
     def _initialize_tools(self) -> List[BaseTool]:
         tools: List[BaseTool] = []
 
         @tool
         def detect_objects(image_hint: Optional[str] = "") -> str:
-            """
-            Call /vision/detect_objects (DetectObjects.srv) which returns bounding boxes and meta info.
-            Returns a short textual summary with counts and first few bboxes.
-            """
+            """Call /vision/detect_objects to get bounding boxes."""
             tool_name = "detect_objects"
             with self._tools_called_lock:
                 self._tools_called.append(tool_name)
@@ -425,9 +500,7 @@ class Ros2HighLevelAgentNode(Node):
 
         @tool
         def classify_all() -> str:
-            """
-            Trigger /vision/classify_all (std_srvs/Trigger) to classify entire frame or all detections.
-            """
+            """Trigger /vision/classify_all."""
             tool_name = "classify_all"
             with self._tools_called_lock:
                 self._tools_called.append(tool_name)
@@ -447,116 +520,8 @@ class Ros2HighLevelAgentNode(Node):
         tools.append(classify_all)
 
         @tool
-        def classify_bb(x1: int, y1: int, x2: int, y2: int) -> str:
-            """
-            Call /vision/classify_bb with bounding box coordinates.
-            Returns the top label + confidence and the raw 'all_predictions' JSON string (truncated).
-            """
-            tool_name = "classify_bb"
-            with self._tools_called_lock:
-                self._tools_called.append(tool_name)
-            try:
-                if not self.vision_classify_bb_client.wait_for_service(timeout_sec=5.0):
-                    return "Service /vision/classify_bb unavailable"
-                req = ClassifyBBox.Request()
-                req.x1 = int(x1)
-                req.y1 = int(y1)
-                req.x2 = int(x2)
-                req.y2 = int(y2)
-                future = self.vision_classify_bb_client.call_async(req)
-                rclpy.spin_until_future_complete(self, future)
-                resp = future.result()
-                if resp is None:
-                    return "No response from /vision/classify_bb"
-                if not resp.success:
-                    return f"classify_bb failed: {resp.all_predictions or 'error'}"
-                allpred = resp.all_predictions or ""
-                if len(allpred) > 400:
-                    allpred_trunc = allpred[:400] + "...(truncated)"
-                else:
-                    allpred_trunc = allpred
-                return f"classify_bb: label='{resp.label}', confidence={resp.confidence:.3f}, all_predictions={allpred_trunc}"
-            except Exception as e:
-                return f"ERROR in classify_bb: {e}"
-
-        tools.append(classify_bb)
-
-        @tool
-        def detect_grasp() -> str:
-            """
-            Call /vision/detect_grasp to compute grasps for all detected objects.
-            Returns a short summary describing how many grasps were found and top qualities.
-            """
-            tool_name = "detect_grasp"
-            with self._tools_called_lock:
-                self._tools_called.append(tool_name)
-            try:
-                if not self.vision_detect_grasp_client.wait_for_service(timeout_sec=5.0):
-                    return "Service /vision/detect_grasp unavailable"
-                req = DetectGrasps.Request()
-                future = self.vision_detect_grasp_client.call_async(req)
-                rclpy.spin_until_future_complete(self, future)
-                resp = future.result()
-                if resp is None:
-                    return "No response from /vision/detect_grasp"
-                if not resp.success:
-                    return f"detect_grasp failed: {resp.error_message or 'unknown'}"
-                total = int(resp.total_grasps)
-                qualities = []
-                try:
-                    for i in range(min(3, len(resp.grasp_poses))):
-                        qualities.append(f"{resp.grasp_poses[i].quality_score:.3f}")
-                except Exception:
-                    pass
-                qual_summary = ", ".join(qualities) if qualities else "no quality info"
-                return f"detect_grasp: total_grasps={total}, sample_qualities=[{qual_summary}]"
-            except Exception as e:
-                return f"ERROR in detect_grasp: {e}"
-
-        tools.append(detect_grasp)
-
-        @tool
-        def detect_grasp_bb(x1: int, y1: int, x2: int, y2: int) -> str:
-            """
-            Call /vision/detect_grasp_bb to compute a single grasp pose for the specified bounding box.
-            Returns a compact textual description of the returned GraspPose.
-            """
-            tool_name = "detect_grasp_bb"
-            with self._tools_called_lock:
-                self._tools_called.append(tool_name)
-            try:
-                if not self.vision_detect_grasp_bb_client.wait_for_service(timeout_sec=5.0):
-                    return "Service /vision/detect_grasp_bb unavailable"
-                req = DetectGraspBBox.Request()
-                req.x1 = int(x1)
-                req.y1 = int(y1)
-                req.x2 = int(x2)
-                req.y2 = int(y2)
-                future = self.vision_detect_grasp_bb_client.call_async(req)
-                rclpy.spin_until_future_complete(self, future)
-                resp = future.result()
-                if resp is None:
-                    return "No response from /vision/detect_grasp_bb"
-                if not resp.success:
-                    return f"detect_grasp_bb failed: {resp.error_message or 'unknown'}"
-                gp = resp.grasp_pose
-                pos = gp.position
-                ori = gp.orientation
-                return (f"grasp_bb: object_id={gp.object_id}, bbox={list(gp.bbox)}, "
-                        f"pos=({pos.x:.3f},{pos.y:.3f},{pos.z:.3f}), "
-                        f"ori=({ori.x:.3f},{ori.y:.3f},{ori.z:.3f},{ori.w:.3f}), "
-                        f"quality={gp.quality_score:.3f}, width={gp.width:.3f}, approach={gp.approach_direction}")
-            except Exception as e:
-                return f"ERROR in detect_grasp_bb: {e}"
-
-        tools.append(detect_grasp_bb)
-
-        @tool
         def understand_scene() -> str:
-            """
-            Call /vision/understand_scene which returns a SceneUnderstanding message.
-            We extract a short natural-language summary and a few stats for the LLM.
-            """
+            """Call /vision/understand_scene for scene understanding."""
             tool_name = "understand_scene"
             with self._tools_called_lock:
                 self._tools_called.append(tool_name)
@@ -585,9 +550,50 @@ class Ros2HighLevelAgentNode(Node):
         return tools
 
     # -----------------------
-    # Create PDDL-generating agent
+    # Create PDDL agent
     # -----------------------
     def _create_pddl_agent_executor(self) -> AgentExecutor:
+<<<<<<< HEAD
+        """Create an agent that generates PDDL domain and problem files."""
+        system_message = f"""You are a PDDL domain and problem generator for a robot planning system.
+
+You have access to vision tools to understand the scene (detect_objects, classify_all, understand_scene).
+The current robot state will be provided in the user message.
+
+Below is a TEMPLATE DOMAIN with predefined actions. You should use this as a starting point:
+
+{FIXED_DOMAIN}
+
+Your task is to:
+1. Review the template domain above
+2. Modify it ONLY if absolutely necessary (e.g., if you need additional predicates, types, or action parameters)
+3. Generate a corresponding PROBLEM file with:
+   - Object definitions (include directions: left, right, up, down, forward, backward as direction objects)
+   - Initial state based on the provided current robot state
+   - Goal state that achieves the user's instruction
+
+IMPORTANT GUIDELINES:
+- Prefer using the template domain as-is whenever possible
+- Only modify the domain if the task genuinely requires additional capabilities
+- If you modify the domain, explain why in your reasoning
+- Always ensure domain and problem are compatible
+- Keep modifications minimal and focused
+
+Follow this format exactly:
+REASONING:
+[Explain your approach and any domain modifications]
+
+DOMAIN:
+```pddl
+[domain content - use template or modified version]
+```
+
+PROBLEM:
+```pddl
+[problem content]
+```
+"""
+=======
         """
         Create an agent whose job is to generate valid PDDL domain/problem given
         a natural language instruction and optionally using the vision tools.
@@ -607,6 +613,7 @@ class Ros2HighLevelAgentNode(Node):
             "DOMAIN:\n```pddl\n[domain content]\n```\n\n"
             "PROBLEM:\n```pddl\n[problem content]\n```\n"
         )
+>>>>>>> main
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_message),
@@ -618,7 +625,7 @@ class Ros2HighLevelAgentNode(Node):
         return AgentExecutor(agent=agent, tools=self.tools, verbose=True, max_iterations=12)
 
     # -----------------------
-    # Action server callbacks (high-level)
+    # Action server callbacks
     # -----------------------
     def goal_callback(self, goal_request) -> GoalResponse:
         self.get_logger().info(f"[high-level action] Received goal: {getattr(goal_request, 'prompt', '')}")
@@ -631,10 +638,7 @@ class Ros2HighLevelAgentNode(Node):
         return CancelResponse.ACCEPT
 
     async def execute_callback(self, goal_handle):
-        """
-        Execute incoming high-level Prompt action by running the PDDL pipeline.
-        Publishes periodic feedback with tools called.
-        """
+        """Execute incoming high-level Prompt action."""
         start_time = time.perf_counter()
         prompt_text = goal_handle.request.prompt
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
@@ -652,14 +656,12 @@ class Ros2HighLevelAgentNode(Node):
 
                 self.get_logger().info(f"High-level Prompt action received: {goal_text}")
 
-                # Generate plan but do not execute
                 steps = self._generate_plan(goal_text)
                 if not steps:
                     result_container["success"] = False
                     result_container["final_response"] = "Failed to generate plan"
                     return
 
-                # Wait for confirmation
                 msg = f"Generated {len(steps)} step(s). Please review and confirm via /confirm to execute."
                 result_container["success"] = True
                 result_container["final_response"] = msg
@@ -671,7 +673,6 @@ class Ros2HighLevelAgentNode(Node):
         thread = threading.Thread(target=run_pipeline, daemon=True)
         thread.start()
 
-        # Publish periodic feedback
         while thread.is_alive():
             with self._tools_called_lock:
                 tools_snapshot = list(self._tools_called)
@@ -682,7 +683,6 @@ class Ros2HighLevelAgentNode(Node):
                 pass
             time.sleep(0.5)
 
-        # final feedback
         with self._tools_called_lock:
             tools_snapshot = list(self._tools_called)
         feedback_msg.tools_called = tools_snapshot
@@ -698,41 +698,15 @@ class Ros2HighLevelAgentNode(Node):
         goal_handle.succeed()
         self.get_logger().info(f"[high-level action] Goal finished. success={result_msg.success}")
         end_time = time.perf_counter()
-        benchmark_info = f"High-level action completed in {end_time - start_time:.2f} seconds.\n Number of tools called: {len(tools_snapshot)}"
+        benchmark_info = f"High-level action completed in {end_time - start_time:.2f} seconds.\nNumber of tools called: {len(tools_snapshot)}"
         self.benchmark_pub.publish(String(data=benchmark_info))
         return result_msg
 
     # -----------------------
-    # Helpers: send step and return result object
+    # Medium-level communication
     # -----------------------
-    def send_step_to_medium(self, step_text: str, timeout: float = 60.0) -> Optional[Prompt.Result]:
-        """
-        Synchronous helper: sends a step to the /medium_level Prompt action server and waits for the result.
-        """
-        try:
-            if not self.medium_level_client.wait_for_server(timeout_sec=5.0):
-                self.get_logger().error("/medium_level action server unavailable")
-                return None
-            goal = Prompt.Goal()
-            goal.prompt = step_text
-            send_future = self.medium_level_client.send_goal_async(goal)
-            rclpy.spin_until_future_complete(self, send_future)
-            goal_handle = send_future.result()
-            if not goal_handle.accepted:
-                self.get_logger().error("Medium-level goal rejected")
-                return None
-            result_future = goal_handle.get_result_async()
-            rclpy.spin_until_future_complete(self, result_future, timeout_sec=timeout)
-            result = result_future.result().result
-            return result
-        except Exception as e:
-            self.get_logger().error(f"Exception when sending to medium: {e}")
-            return None
-
     def send_step_to_medium_async(self, step_text: str, timeout: float = 60.0) -> Optional[Prompt.Result]:
-        """
-        Thread-safe version that uses threading.Event instead of spin_until_future_complete.
-        """
+        """Send a step to medium-level action server."""
         try:
             if not self.medium_level_client.wait_for_server(timeout_sec=5.0):
                 self.get_logger().error("/medium_level action server unavailable")
@@ -741,27 +715,22 @@ class Ros2HighLevelAgentNode(Node):
             goal = Prompt.Goal()
             goal.prompt = step_text
             
-            # Use events to wait for async operations
             goal_event = threading.Event()
             result_event = threading.Event()
             goal_handle_container = [None]
             result_container = [None]
             
-            # Callback for goal response
             def goal_response_callback(future):
                 goal_handle_container[0] = future.result()
                 goal_event.set()
             
-            # Callback for result
             def result_callback(future):
                 result_container[0] = future.result()
                 result_event.set()
             
-            # Send goal
             send_future = self.medium_level_client.send_goal_async(goal)
             send_future.add_done_callback(goal_response_callback)
             
-            # Wait for goal acceptance
             if not goal_event.wait(timeout=5.0):
                 self.get_logger().error("Timeout waiting for goal acceptance")
                 return None
@@ -771,11 +740,9 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().error("Medium-level goal rejected")
                 return None
             
-            # Get result
             result_future = goal_handle.get_result_async()
             result_future.add_done_callback(result_callback)
             
-            # Wait for result
             if not result_event.wait(timeout=timeout):
                 self.get_logger().error("Timeout waiting for result")
                 return None
@@ -794,7 +761,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("Shutting down Ros2 High-Level Agent Node (PDDL).")
+        node.get_logger().info("Shutting down Ros2 High-Level Agent Node (Fixed PDDL Domain).")
     finally:
         node.destroy_node()
         rclpy.shutdown()
