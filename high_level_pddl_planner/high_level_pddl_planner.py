@@ -383,27 +383,40 @@ Current Robot State:
     # -----------------------
     # PDDL parsing helpers
     # -----------------------
-    def _parse_problem_from_text(self, text: str) -> Optional[str]:
-        """Extract only the PROBLEM PDDL from LLM output."""
+    def _parse_domain_and_problem_from_text(self, text: str) -> Optional[PDDLGenerationResult]:
+        """Extract DOMAIN and PROBLEM PDDL from LLM output."""
         try:
-            # Try code fence format
+            # Try code fence format first
+            domain_match = re.search(r"DOMAIN:\s*```pddl\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
             problem_match = re.search(r"PROBLEM:\s*```pddl\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-            if problem_match:
-                return problem_match.group(1).strip()
+            
+            if domain_match and problem_match:
+                domain = domain_match.group(1).strip()
+                problem = problem_match.group(1).strip()
+                reasoning_match = re.search(r"REASONING:\s*(.*?)(?=DOMAIN:|PROBLEM:|$)", text, re.DOTALL | re.IGNORECASE)
+                reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
+                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning=reasoning)
 
             # Try simple split
-            if "PROBLEM:" in text:
+            if "DOMAIN:" in text and "PROBLEM:" in text:
+                domain_part = text.split("DOMAIN:")[1].split("PROBLEM:")[0].strip()
                 problem_part = text.split("PROBLEM:")[1].strip()
+                domain = domain_part.strip("` \n")
                 problem = problem_part.strip("` \n")
-                return problem
+                reasoning_match = re.search(r"REASONING:\s*(.*?)(?=DOMAIN:|PROBLEM:|$)", text, re.DOTALL | re.IGNORECASE)
+                reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
+                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning=reasoning)
 
-            # Try finding define problem block
+            # Try finding define blocks
+            domain_paren = re.search(r"\(define\s*\(domain.*?\)\)", text, re.DOTALL | re.IGNORECASE)
             problem_paren = re.search(r"\(define\s*\(problem.*?\)\)", text, re.DOTALL | re.IGNORECASE)
-            if problem_paren:
-                return problem_paren.group(0).strip()
+            if domain_paren and problem_paren:
+                domain = domain_paren.group(0).strip()
+                problem = problem_paren.group(0).strip()
+                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning="")
                 
         except Exception as e:
-            self.get_logger().error(f"Error extracting PDDL problem from text: {e}")
+            self.get_logger().error(f"Error extracting PDDL from text: {e}")
         return None
 
     def _run_fast_downward(self, domain_file: str, problem_file: str, timeout: int = 300) -> PlanningResult:
