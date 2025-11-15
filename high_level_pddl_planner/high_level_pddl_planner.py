@@ -130,6 +130,8 @@ class Ros2HighLevelAgentNode(Node):
         self.real_hardware: bool = self.get_parameter("real_hardware").get_parameter_value().bool_value
         self.declare_parameter("use_ollama", False)
         self.use_ollama: bool = self.get_parameter("use_ollama").get_parameter_value().bool_value
+        self.declare_parameter("confirm", True)
+        self.confirm: bool = self.get_parameter("confirm").get_parameter_value().bool_value
 
         # -----------------------------
         # LLM Selection: Gemini or Ollama
@@ -349,10 +351,39 @@ Current Robot State:
             self.latest_plan = plan_lines
 
             readable_plan = "\n".join([f"{i+1}. {s}" for i, s in enumerate(plan_lines)])
-            self.response_pub.publish(String(
-                data=f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and confirm if this looks good!"
-            ))
-            self.get_logger().info(f"Generated plan with {len(plan_lines)} steps, waiting for /confirm.")
+            if self.confirm:
+                self.response_pub.publish(String(
+                    data=f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and confirm if this looks good!"
+                ))
+                self.get_logger().info(f"Generated plan with {len(plan_lines)} steps, waiting for /confirm.")
+            else:
+                def execute_plan():
+                    self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
+                    self.get_logger().info("Executing confirmed plan...")
+
+                    for i, step in enumerate(self.latest_plan, start=1):
+                        self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
+                        result = self.send_step_to_medium_async(step)
+
+                        if result is None or not result.success:
+                            msg = f"Step {i} failed: {step}. Stopping execution."
+                            self.response_pub.publish(String(data=msg))
+                            self.get_logger().error(msg)
+                            break
+                        else:
+                            done_msg = f"Step {i} completed successfully."
+                            self.response_pub.publish(String(data=done_msg))
+                            self.get_logger().info(done_msg)
+
+                    self.response_pub.publish(String(data="Plan execution finished."))
+                    self.get_logger().info("All steps done. Clearing chat history and plan.")
+                    self.chat_history.clear()
+                    self.latest_plan = None
+                    self.latest_pddl = None
+
+                execution_thread = threading.Thread(target=execute_plan, daemon=True)
+                execution_thread.start()
+
             return plan_lines
 
         except Exception as e:
