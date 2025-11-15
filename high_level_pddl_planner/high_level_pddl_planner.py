@@ -29,6 +29,7 @@ from custom_interfaces.srv import (
     DetectGrasps,
     DetectGraspBBox,
     UnderstandScene,
+    FindObject,
     GetSetBool,
 )
 
@@ -167,6 +168,7 @@ class Ros2HighLevelAgentNode(Node):
         self.vision_detect_grasp_client = self.create_client(DetectGrasps, "/vision/detect_grasp")
         self.vision_detect_grasp_bb_client = self.create_client(DetectGraspBBox, "/vision/detect_grasp_bb")
         self.vision_understand_scene_client = self.create_client(UnderstandScene, "/vision/understand_scene")
+        self.vision_find_object_client = self.create_client(FindObject, "/vision/find_object")
 
         # State query service clients
         self.is_home_client = self.create_client(GetSetBool, "/is_home")
@@ -565,6 +567,35 @@ Current Robot State:
 
         tools.append(understand_scene)
 
+        @tool
+        def find_object(label: str) -> str:
+            """
+            Call /vision/find_object to locate an object by label.
+            Returns the bounding box and if found.
+            """
+            tool_name = "find_object"
+            with self._tools_called_lock:
+                self._tools_called.append(tool_name)
+            try:
+                if not self.vision_find_object_client.wait_for_service(timeout_sec=5.0):
+                    return "Service /vision/find_object unavailable"
+                req = FindObject.Request()
+                req.label = label
+                future = self.vision_find_object_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future)
+                resp = future.result()
+                if resp is None:
+                    return "No response from /vision/find_object"
+                if not resp.success:
+                    return f"find_object failed: {resp.error_message or 'unknown'}"
+                bbox = resp.bbox
+                msg = resp.message or ""
+                return f"find_object: label='{label}', bbox=[{bbox.x1},{bbox.y1},{bbox.x2},{bbox.y2}], message='{msg}'"
+            except Exception as e:
+                return f"ERROR in find_object: {e}"
+        
+        tools.append(find_object)
+
         return tools
 
     # -----------------------
@@ -574,7 +605,7 @@ Current Robot State:
         """Create an agent that generates PDDL domain and problem files."""
         system_message = f"""You are a PDDL domain and problem generator for a robot planning system.
 
-        You have access to vision tools to understand the scene (detect_objects, classify_all, understand_scene).
+        You have access to vision tools to understand the scene (detect_objects, classify_all, understand_scene, find_object).
         The current robot state will be provided in the user message.
 
         Below is a TEMPLATE DOMAIN with predefined actions. You should use this as a starting point:
