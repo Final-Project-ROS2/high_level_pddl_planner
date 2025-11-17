@@ -375,6 +375,9 @@ Current Robot State:
                             self.response_pub.publish(String(data=done_msg))
                             self.get_logger().info(done_msg)
 
+                    end_time = time.perf_counter()
+                    benchmark_info = f"High-level action completed in {end_time - self.start_time:.2f} seconds."
+                    self.benchmark_pub.publish(String(data=benchmark_info))
                     self.response_pub.publish(String(data="Plan execution finished."))
                     self.get_logger().info("All steps done. Clearing chat history and plan.")
                     self.chat_history.clear()
@@ -666,7 +669,7 @@ Current Robot State:
 
     async def execute_callback(self, goal_handle):
         """Execute incoming high-level Prompt action."""
-        start_time = time.perf_counter()
+        self.start_time = time.perf_counter()
         prompt_text = goal_handle.request.prompt
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
 
@@ -724,9 +727,6 @@ Current Robot State:
 
         goal_handle.succeed()
         self.get_logger().info(f"[high-level action] Goal finished. success={result_msg.success}")
-        end_time = time.perf_counter()
-        benchmark_info = f"High-level action completed in {end_time - start_time:.2f} seconds.\nNumber of tools called: {len(tools_snapshot)}"
-        self.benchmark_pub.publish(String(data=benchmark_info))
         return result_msg
 
     # -----------------------
