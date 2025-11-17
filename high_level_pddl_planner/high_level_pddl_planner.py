@@ -516,7 +516,7 @@ Current Robot State:
             except Exception as e:
                 return f"ERROR in detect_objects: {e}"
 
-        tools.append(detect_objects)
+        # tools.append(detect_objects)
 
         @tool
         def classify_all() -> str:
@@ -537,7 +537,7 @@ Current Robot State:
             except Exception as e:
                 return f"ERROR in classify_all: {e}"
 
-        tools.append(classify_all)
+        # tools.append(classify_all)
 
         @tool
         def understand_scene() -> str:
@@ -565,7 +565,7 @@ Current Robot State:
             except Exception as e:
                 return f"ERROR in understand_scene: {e}"
 
-        tools.append(understand_scene)
+        # tools.append(understand_scene)
 
         @tool
         def find_object(label: str) -> str:
@@ -594,7 +594,7 @@ Current Robot State:
             except Exception as e:
                 return f"ERROR in find_object: {e}"
         
-        tools.append(find_object)
+        # tools.append(find_object)
 
         return tools
 
@@ -605,7 +605,6 @@ Current Robot State:
         """Create an agent that generates PDDL domain and problem files."""
         system_message = f"""You are a PDDL domain and problem generator for a robot planning system.
 
-        You have access to vision tools to understand the scene (detect_objects, classify_all, understand_scene, find_object).
         The current robot state will be provided in the user message.
 
         Below is a TEMPLATE DOMAIN with predefined actions. You should use this as a starting point:
