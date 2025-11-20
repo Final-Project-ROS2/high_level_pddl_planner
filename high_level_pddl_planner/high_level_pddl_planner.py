@@ -53,7 +53,7 @@ FIXED_DOMAIN = """(define (domain robot-manipulation)
   (:requirements :strips :typing)
   
   (:types
-    location direction
+    location direction object
   )
   
   (:predicates
@@ -98,9 +98,20 @@ FIXED_DOMAIN = """(define (domain robot-manipulation)
   (:action move_to_direction
     :parameters (?dir - direction)
     :precondition (and)
-    :effect (and)
+    :effect (and
+      (not (robot-at home))
+      (not (robot-at ready))
+    )
   )
-)
+
+  (:action move_to_object
+    :parameters (?obj - object)
+    :precondition (and)
+    :effect (and
+      (not (robot-at home))
+      (not (robot-at ready))
+    )
+  )
 """
 
 
