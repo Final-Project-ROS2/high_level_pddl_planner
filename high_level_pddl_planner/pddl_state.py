@@ -7,10 +7,12 @@ class StateManager(Node):
     def __init__(self):
         super().__init__('state_manager')
 
-        # Internal state variables
-        self.is_home = True
-        self.is_ready = False
-        self.gripper_is_open = False
+        self.declare_parameter("is_home", True)
+        self.is_home: bool = self.get_parameter("is_home").get_parameter_value().bool_value
+        self.declare_parameter("is_ready", False)
+        self.is_ready: bool = self.get_parameter("is_ready").get_parameter_value().bool_value
+        self.declare_parameter("gripper_is_open", False)
+        self.gripper_is_open: bool = self.get_parameter("gripper_is_open").get_parameter_value().bool_value
 
         # Service servers
         self.is_home_srv = self.create_service(
