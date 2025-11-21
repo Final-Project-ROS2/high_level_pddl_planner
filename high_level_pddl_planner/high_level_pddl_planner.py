@@ -53,11 +53,12 @@ FIXED_DOMAIN = """(define (domain robot-manipulation)
   (:requirements :strips :typing)
   
   (:types
-    location direction
+    location direction object
   )
   
   (:predicates
     (robot-at ?loc - location)
+    (robot-at ?obj - object)
     (gripper-open)
     (gripper-closed)
   )
@@ -98,9 +99,11 @@ FIXED_DOMAIN = """(define (domain robot-manipulation)
   (:action move_to_direction
     :parameters (?dir - direction)
     :precondition (and)
-    :effect (and)
+    :effect (and
+      (not (robot-at home))
+      (not (robot-at ready))
+    )
   )
-)
 """
 
 
@@ -149,7 +152,7 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().warn("No LLM API key found in environment variables GEMINI_API_KEY.")
             self.get_logger().info("Using Google Gemini API LLM.")
             self.llm = ChatGoogleGenerativeAI(
-                model="gemini-2.5-flash",
+                model="gemini-2.5-pro",
                 google_api_key=api_key,
                 temperature=0.0,
             )
@@ -617,18 +620,18 @@ Current Robot State:
 
         Your task is to:
         1. Review the template domain above
-        2. Modify it ONLY if absolutely necessary (e.g., if you need additional predicates, types, or action parameters)
+        2. Modify it (e.g., if you need additional predicates, types, or action parameters)
         3. Generate a corresponding PROBLEM file with:
         - Object definitions (include directions: left, right, up, down, forward, backward as direction objects)
         - Initial state based on the provided current robot state
         - Goal state that achieves the user's instruction
 
         IMPORTANT GUIDELINES:
-        - Prefer using the template domain as-is whenever possible
-        - Only modify the domain if the task genuinely requires additional capabilities
-        - If you modify the domain, explain why in your reasoning
+        - Prefer using a modified domain whenever possible
+        - You can create new actions if necessary
+        - The robot can move to a given object, generate move_to_<object> actions as needed
+        - DO NOT modify the actions name or parameters
         - Always ensure domain and problem are compatible
-        - Keep modifications minimal and focused
 
         Follow this format exactly:
         REASONING:
