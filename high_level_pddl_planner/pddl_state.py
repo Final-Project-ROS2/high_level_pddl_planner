@@ -11,6 +11,8 @@ class StateManager(Node):
         self.is_home: bool = self.get_parameter("is_home").get_parameter_value().bool_value
         self.declare_parameter("is_ready", False)
         self.is_ready: bool = self.get_parameter("is_ready").get_parameter_value().bool_value
+        self.declare_parameter("is_handover", False)
+        self.is_handover: bool = self.get_parameter("is_handover").get_parameter_value().bool_value
         self.declare_parameter("gripper_is_open", False)
         self.gripper_is_open: bool = self.get_parameter("gripper_is_open").get_parameter_value().bool_value
 
@@ -20,6 +22,9 @@ class StateManager(Node):
         )
         self.is_ready_srv = self.create_service(
             GetSetBool, '/is_ready', self.is_ready_callback
+        )
+        self.is_handover_srv = self.create_service(
+            GetSetBool, '/is_handover', self.is_handover_callback
         )
         self.gripper_open_srv = self.create_service(
             GetSetBool, '/gripper_is_open', self.gripper_open_callback
@@ -47,6 +52,17 @@ class StateManager(Node):
         else:
             response.message = f"is_ready is {self.is_ready}"
         response.value = self.is_ready
+        self.get_logger().info(response.message)
+        return response
+
+    def is_handover_callback(self, request, response):
+        response.success = True
+        if request.set:
+            self.is_handover = request.value
+            response.message = f"is_handover set to {self.is_handover}"
+        else:
+            response.message = f"is_handover is {self.is_handover}"
+        response.value = self.is_handover
         self.get_logger().info(response.message)
         return response
 
