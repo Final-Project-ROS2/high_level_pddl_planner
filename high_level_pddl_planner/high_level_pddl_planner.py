@@ -204,6 +204,13 @@ class Ros2HighLevelAgentNode(Node):
 
         self.get_logger().info("Ros2 High-Level Agent Node (Fixed PDDL Domain) ready.")
 
+    def _benchmark_log(self, label: str):
+        t = self.get_clock().now()
+        t_sec = t.nanoseconds * 1e-9
+        self.benchmark_pub.publish(
+            String(data=f"{label},{t_sec:.9f}")
+        )
+
     # -----------------------
     # State query helpers
     # -----------------------
@@ -255,13 +262,21 @@ class Ros2HighLevelAgentNode(Node):
         text = msg.data.strip()
         if not text:
             return
+
+        start_time = time.perf_counter()
+        self._benchmark_log("transcript_received")
+
         with self._last_transcript_lock:
             self._last_transcript = text
         self.get_logger().info(f"Received transcript: {text}")
-        plan_thread = threading.Thread(target=self._generate_plan, args=(text,), daemon=True)
+        plan_thread = threading.Thread(
+            target=self._generate_plan, 
+            args=(text, start_time), 
+            daemon=True
+        )
         plan_thread.start()
 
-    def _generate_plan(self, instruction_text: str) -> List[str]:
+    def _generate_plan(self, instruction_text: str, start_time: Optional[float] = None) -> List[str]:
         """Generate a plan using fixed domain and dynamic problem generation."""
         self.chat_history.append({"role": "user", "content": instruction_text})
 
@@ -337,6 +352,12 @@ Current Robot State:
             # Run Fast Downward
             self.response_pub.publish(String(data="Solving the PDDL problem using Fast Downward"))
             plan_result = self._run_fast_downward(str(domain_path), str(problem_path))
+
+            if start_time is not None:
+                end_time = time.perf_counter()
+                self._benchmark_log("plan_generated")
+                self.benchmark_pub.publish(String(data=f"Plan generated in: ,{end_time - start_time:.2f}"))
+
             if plan_result.status != "success" or not plan_result.plan.strip():
                 msg = f"I couldn't find a valid plan. The planner returned: {plan_result.status}"
                 self.get_logger().warn(f"Planner returned no plan. status={plan_result.status} rc={plan_result.return_code}")
@@ -673,6 +694,8 @@ Current Robot State:
     async def execute_callback(self, goal_handle):
         """Execute incoming high-level Prompt action."""
         self.start_time = time.perf_counter()
+        self._benchmark_log("action_goal_received")
+
         prompt_text = goal_handle.request.prompt
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
 
@@ -689,7 +712,7 @@ Current Robot State:
 
                 self.get_logger().info(f"High-level Prompt action received: {goal_text}")
 
-                steps = self._generate_plan(goal_text)
+                steps = self._generate_plan(goal_text, start_time=self.start_time)
                 if not steps:
                     result_container["success"] = False
                     result_container["final_response"] = "Failed to generate plan"
