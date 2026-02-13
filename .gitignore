@@ -33,4 +33,11 @@ build/
 fastdownward/
 
 generate/api_keys.csv
-generate/instructions.csv
+generate/instructions*.csv
+generate/domains/
+generate/problems/
+generate/answer_key/
+generate/plans/
+generate/results/
+
+generate/fast-downward/

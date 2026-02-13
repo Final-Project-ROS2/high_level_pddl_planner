@@ -21,26 +21,26 @@ from langchain_core.messages import HumanMessage
 
 # Available Gemini models to rotate through
 AVAILABLE_MODELS = [
-    "gemini-2.0-flash-exp",
+    "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-3",
-    "gemini-3-flash",
 ]
 
 
 # Fixed PDDL Domain Template (same as in high_level_pddl_planner)
-FIXED_DOMAIN = """(define (domain robot-manipulation)
-  (:requirements :strips :typing)
+FIXED_DOMAIN = """
+(define (domain robot-manipulation)
+  (:requirements :strips :typing :conditional-effects)
   
   (:types
     location direction object
   )
   
   (:predicates
-    (robot-at ?loc - location)
-    (robot-at ?obj - object)
+    (robot-at-location ?loc - location)
+    (robot-at-object ?obj - object)
+    (robot-have ?obj - object)
     (gripper-open)
     (gripper-closed)
   )
@@ -49,29 +49,32 @@ FIXED_DOMAIN = """(define (domain robot-manipulation)
     :parameters ()
     :precondition (and)
     :effect (and
-      (robot-at home)
-      (not (robot-at ready))
-      (not (robot-at handover))
+      (robot-at-location home)
+      (not (robot-at-location ready))
+      (not (robot-at-location handover))
+      (forall (?obj - object) (not (robot-at-object ?obj)))
     )
   )
   
   (:action move_to_ready
     :parameters ()
-    :precondition (robot-at home)
+    :precondition (and)
     :effect (and
-      (robot-at ready)
-      (not (robot-at home))
-      (not (robot-at handover))
+      (robot-at-location ready)
+      (not (robot-at-location home))
+      (not (robot-at-location handover))
+      (forall (?obj - object) (not (robot-at-object ?obj)))
     )
   )
 
   (:action move_to_handover
     :parameters ()
-    :precondition (robot-at home)
+    :precondition (and)
     :effect (and
-      (robot-at handover)
-      (not (robot-at home))
-      (not (robot-at ready))
+      (robot-at-location handover)
+      (not (robot-at-location home))
+      (not (robot-at-location ready))
+      (forall (?obj - object) (not (robot-at-object ?obj)))
     )
   )
   
@@ -97,11 +100,46 @@ FIXED_DOMAIN = """(define (domain robot-manipulation)
     :parameters (?dir - direction)
     :precondition (and)
     :effect (and
-      (not (robot-at home))
-      (not (robot-at ready))
+      (not (robot-at-location ready))
+      (not (robot-at-location handover))
+      (forall (?obj - object) (not (robot-at-object ?obj)))
+      (not (robot-at-location home))
+      (not (robot-at-location ready))
     )
   )
-)"""
+
+  (:action move_to_object
+    :parameters (?obj - object)
+    :precondition (and
+      (robot-at-location ready)
+    )
+    :effect (and
+      (robot-at-object ?obj)
+      (not (robot-at-location home))
+      (not (robot-at-location ready))
+      (not (robot-at-location handover))
+    )
+  )
+
+  (:action pick-object
+    :parameters (?obj - object)
+    :precondition (and
+      (robot-at-location ready)
+    )
+    :effect (and
+      (robot-at-object ?obj)
+      (robot-have ?obj)
+      (not (robot-at-location ready))
+      (not (robot-at-location handover))
+      (forall (?obj2 - object) (when (not (= ?obj ?obj2)) (not (robot-at-object ?obj2))))
+      (not (robot-at-location home))
+      (not (robot-at-location ready))
+      (not (robot-at-location handover))
+    )
+  )
+  
+)
+"""
 
 
 class PDDLGenerationResult:
@@ -118,12 +156,15 @@ class APIKeyManager:
     def __init__(self, api_keys: List[str], models: List[str] = None):
         self.api_keys = api_keys
         self.models = models if models else AVAILABLE_MODELS.copy()
-        self.usable_models = set(self.models)  # Track which models are usable
+        self.usable_models = self.models.copy()  # Track which models are usable (use list for consistent ordering)
         self.current_key_index = 0
         self.current_model_index = 0
         self.rate_limit_count = {key: 0 for key in api_keys}
         self.cooldown_until = {key: 0 for key in api_keys}
         self.model_errors = {model: 0 for model in self.models}
+        
+        # Track which (key, model) combinations are rate-limited
+        self.key_model_cooldown = {key: {} for key in api_keys}  # {key: {model: cooldown_time}}
         
     def get_current_key(self) -> str:
         """Get the current API key"""
@@ -134,10 +175,9 @@ class APIKeyManager:
         if not self.usable_models:
             return None
         
-        # Ensure current index points to a usable model
-        usable_list = list(self.usable_models)
-        self.current_model_index = self.current_model_index % len(usable_list)
-        return usable_list[self.current_model_index]
+        # Ensure current index is within bounds
+        self.current_model_index = self.current_model_index % len(self.usable_models)
+        return self.usable_models[self.current_model_index]
     
     def rotate_key(self):
         """Rotate to the next API key"""
@@ -149,21 +189,28 @@ class APIKeyManager:
         if len(self.usable_models) <= 1:
             return
         
-        usable_list = list(self.usable_models)
-        self.current_model_index = (self.current_model_index + 1) % len(usable_list)
-        print(f"Rotated to model: {usable_list[self.current_model_index]}")
+        self.current_model_index = (self.current_model_index + 1) % len(self.usable_models)
+        print(f"Rotated to model: {self.usable_models[self.current_model_index]}")
     
     def mark_model_unusable(self, model: str, error_msg: str = ""):
         """Mark a model as unusable and remove it from rotation"""
         if model in self.usable_models:
+            removed_index = self.usable_models.index(model)
             self.usable_models.remove(model)
             self.model_errors[model] += 1
             print(f"⚠️  Model '{model}' marked as UNUSABLE. Reason: {error_msg}")
             print(f"   Remaining usable models: {len(self.usable_models)}/{len(self.models)}")
             
-            # If we just removed the current model, update index
+            # Adjust current_model_index if necessary
             if self.usable_models:
-                self.current_model_index = 0
+                # If we removed a model before the current index, decrement the index
+                if removed_index < self.current_model_index:
+                    self.current_model_index -= 1
+                # If we removed the current model, keep the index (which now points to next model)
+                elif removed_index == self.current_model_index:
+                    # Wrap around if we're at the end
+                    if self.current_model_index >= len(self.usable_models):
+                        self.current_model_index = 0
     
     def mark_rate_limited(self, api_key: str, cooldown_seconds: int = 60):
         """Mark an API key as rate limited"""
@@ -171,15 +218,67 @@ class APIKeyManager:
         self.cooldown_until[api_key] = time.time() + cooldown_seconds
         print(f"API key marked as rate limited. Cooldown: {cooldown_seconds}s")
     
+    def mark_key_model_rate_limited(self, api_key: str, model: str, cooldown_seconds: int = 200):
+        """Mark a specific (key, model) combination as rate limited"""
+        if api_key not in self.key_model_cooldown:
+            self.key_model_cooldown[api_key] = {}
+        self.key_model_cooldown[api_key][model] = time.time() + cooldown_seconds
+        self.rate_limit_count[api_key] += 1
+        key_num = self.api_keys.index(api_key) + 1
+        print(f"API key #{key_num} + model '{model}' marked as rate limited. Cooldown: {cooldown_seconds}s")
+    
+    def is_model_available_for_key(self, api_key: str, model: str) -> bool:
+        """Check if a model is available for a specific API key (not rate limited)"""
+        if model not in self.usable_models:
+            return False
+        if api_key not in self.key_model_cooldown:
+            return True
+        if model not in self.key_model_cooldown[api_key]:
+            return True
+        return time.time() >= self.key_model_cooldown[api_key][model]
+    
+    def get_next_available_model_for_current_key(self) -> Optional[str]:
+        """Get next available model for the current API key"""
+        current_key = self.get_current_key()
+        
+        if not self.usable_models:
+            return None
+        
+        # Try all models starting from next index
+        for i in range(len(self.usable_models)):
+            idx = (self.current_model_index + 1 + i) % len(self.usable_models)
+            model = self.usable_models[idx]
+            if self.is_model_available_for_key(current_key, model):
+                self.current_model_index = idx
+                return model
+        
+        return None
+    
+    def all_models_exhausted_for_current_key(self) -> bool:
+        """Check if all models are exhausted (rate limited) for current API key"""
+        current_key = self.get_current_key()
+        for model in self.usable_models:
+            if self.is_model_available_for_key(current_key, model):
+                return False
+        return True
+    
+    def has_available_models(self, api_key: str) -> bool:
+        """Check if an API key has any available models (not rate limited)"""
+        for model in self.usable_models:
+            if self.is_model_available_for_key(api_key, model):
+                return True
+        return False
+    
     def is_available(self, api_key: str) -> bool:
         """Check if an API key is available (not in cooldown)"""
         return time.time() >= self.cooldown_until[api_key]
     
     def get_next_available_key(self) -> Optional[str]:
-        """Get the next available API key"""
+        """Get the next available API key that has at least one available model"""
         for _ in range(len(self.api_keys)):
             key = self.get_current_key()
-            if self.is_available(key):
+            # Check both cooldown and model availability
+            if self.is_available(key) and self.has_available_models(key):
                 return key
             self.rotate_key()
         return None
@@ -187,6 +286,31 @@ class APIKeyManager:
 
 class PDDLGenerator:
     """Generates PDDL files from natural language instructions"""
+    
+    # Default fallback problem when parsing fails
+    FALLBACK_PROBLEM = """(define (problem move-open-home)
+  (:domain robot-manipulation)
+  
+  (:objects
+    home ready handover - location
+    left right up down forward backward - direction
+  )
+  
+  (:init
+    (robot-at home)
+    (gripper-open)
+    ; (not (robot-at ready)) is implicit
+    ; (not (robot-at handover)) is implicit
+    ; (not (gripper-closed)) is implicit
+  )
+  
+  (:goal
+    (and
+      (robot-at home)
+      (gripper-open)
+    )
+  )
+)"""
     
     def __init__(self, api_key_manager: APIKeyManager, output_dir: Path):
         self.api_key_manager = api_key_manager
@@ -295,6 +419,20 @@ PROBLEM:
             print(f"Error extracting PDDL from text: {e}")
         return None
     
+    def _save_fallback_pddl(self, instruction_id: int):
+        """Save fallback PDDL files with FAILED marker when parsing fails"""
+        domain_file = self.domains_dir / f"domain_{instruction_id:04d}.pddl"
+        problem_file = self.problems_dir / f"problem_{instruction_id:04d}.pddl"
+        
+        # Add marker to first line
+        domain_content = "; FAILED TO PARSE PDDL\n" + FIXED_DOMAIN
+        problem_content = "; FAILED TO PARSE PDDL\n" + self.FALLBACK_PROBLEM
+        
+        domain_file.write_text(domain_content)
+        problem_file.write_text(problem_content)
+        
+        print(f"[{instruction_id}] ⚠️  Saved fallback PDDL files with FAILED marker")
+    
     def generate_pddl(self, instruction: str, instruction_id: int, max_retries: int = 3) -> bool:
         """Generate PDDL files for a single instruction"""
         print(f"\n[{instruction_id}] Processing: {instruction}")
@@ -350,6 +488,8 @@ Current Robot State:
                         time.sleep(2)
                         continue
                     else:
+                        # After max retries, save fallback files
+                        self._save_fallback_pddl(instruction_id)
                         return False
                 
                 # Save PDDL files
@@ -361,8 +501,8 @@ Current Robot State:
                 
                 print(f"[{instruction_id}] ✓ Successfully generated PDDL files")
                 
-                # Rotate model for next request to distribute load
-                self.api_key_manager.rotate_model()
+                # Keep using same key and model until rate limited
+                # (removed automatic rotation)
                 
                 return True
                 
@@ -386,10 +526,28 @@ Current Robot State:
                 
                 # Check for rate limit errors
                 elif "429" in error_msg or "quota" in error_msg.lower() or "rate" in error_msg.lower():
-                    print(f"[{instruction_id}] Rate limit hit. Rotating API key...")
+                    print(f"[{instruction_id}] Rate limit hit.")
                     current_key = self.api_key_manager.get_current_key()
-                    self.api_key_manager.mark_rate_limited(current_key, cooldown_seconds=60)
-                    self.api_key_manager.rotate_key()
+                    current_model = self.api_key_manager.get_current_model()
+                    
+                    # Mark this (key, model) combination as rate limited
+                    if current_model:
+                        self.api_key_manager.mark_key_model_rate_limited(current_key, current_model, cooldown_seconds=200)
+                    
+                    # Try next available model with same key
+                    next_model = self.api_key_manager.get_next_available_model_for_current_key()
+                    
+                    if next_model:
+                        print(f"[{instruction_id}] Switching to next model: {next_model} (keeping same API key)")
+                    elif self.api_key_manager.all_models_exhausted_for_current_key():
+                        # All models exhausted for this key, move to next key
+                        print(f"[{instruction_id}] All models exhausted for current API key. Moving to next API key...")
+                        self.api_key_manager.rotate_key()
+                        self.api_key_manager.current_model_index = 0  # Reset to first model
+                    else:
+                        # Some models available but in cooldown, wait a bit
+                        print(f"[{instruction_id}] Waiting for model cooldown...")
+                        time.sleep(30)
                     
                     if attempt < max_retries - 1:
                         time.sleep(5)

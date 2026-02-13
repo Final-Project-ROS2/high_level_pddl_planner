@@ -1,0 +1,11 @@
+[project]
+name = "generate"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "langchain>=0.3.27",
+    "langchain-core>=0.3.83",
+    "langchain-google-genai>=2.1.12",
+]
