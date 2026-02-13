@@ -49,16 +49,18 @@ FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", "./fastdownward/fast-downward.p
 SAS_PATH_PLAN = "/home/group11/final_project_ws/src/high_level_pddl_planner/sas_plan"
 
 # Fixed PDDL Domain
-FIXED_DOMAIN = """(define (domain robot-manipulation)
-  (:requirements :strips :typing)
+FIXED_DOMAIN = """
+(define (domain robot-manipulation)
+  (:requirements :strips :typing :conditional-effects)
   
   (:types
     location direction object
   )
   
   (:predicates
-    (robot-at ?loc - location)
-    (robot-at ?obj - object)
+    (robot-at-location ?loc - location)
+    (robot-at-object ?obj - object)
+    (robot-have ?obj - object)
     (gripper-open)
     (gripper-closed)
   )
@@ -67,29 +69,32 @@ FIXED_DOMAIN = """(define (domain robot-manipulation)
     :parameters ()
     :precondition (and)
     :effect (and
-      (robot-at home)
-      (not (robot-at ready))
-      (not (robot-at handover))
+      (robot-at-location home)
+      (not (robot-at-location ready))
+      (not (robot-at-location handover))
+      (forall (?obj - object) (not (robot-at-object ?obj)))
     )
   )
   
   (:action move_to_ready
     :parameters ()
-    :precondition (robot-at home)
+    :precondition (and)
     :effect (and
-      (robot-at ready)
-      (not (robot-at home))
-      (not (robot-at handover))
+      (robot-at-location ready)
+      (not (robot-at-location home))
+      (not (robot-at-location handover))
+      (forall (?obj - object) (not (robot-at-object ?obj)))
     )
   )
 
   (:action move_to_handover
     :parameters ()
-    :precondition (robot-at home)
+    :precondition (and)
     :effect (and
-      (robot-at handover)
-      (not (robot-at home))
-      (not (robot-at ready))
+      (robot-at-location handover)
+      (not (robot-at-location home))
+      (not (robot-at-location ready))
+      (forall (?obj - object) (not (robot-at-object ?obj)))
     )
   )
   
@@ -115,33 +120,45 @@ FIXED_DOMAIN = """(define (domain robot-manipulation)
     :parameters (?dir - direction)
     :precondition (and)
     :effect (and
-      (not (robot-at home))
-      (not (robot-at ready))
+      (not (robot-at-location ready))
+      (not (robot-at-location handover))
+      (forall (?obj - object) (not (robot-at-object ?obj)))
+      (not (robot-at-location home))
+      (not (robot-at-location ready))
     )
   )
 
   (:action move_to_object
     :parameters (?obj - object)
-    :precondition (and)
+    :precondition (and
+      (robot-at-location ready)
+    )
     :effect (and
-      (robot-at ?obj)
-      (not (robot-at home))
-      (not (robot-at ready))
-      (not (robot-at handover))
+      (robot-at-object ?obj)
+      (not (robot-at-location home))
+      (not (robot-at-location ready))
+      (not (robot-at-location handover))
     )
   )
 
-  (:action pick_object
+  (:action pick-object
     :parameters (?obj - object)
     :precondition (and
-      (robot-at ready)
+      (robot-at-location ready)
     )
     :effect (and
-      (gripper-closed)
-      (robot-at ?obj)
-      (not (robot-at ready))
+      (robot-at-object ?obj)
+      (robot-have ?obj)
+      (not (robot-at-location ready))
+      (not (robot-at-location handover))
+      (forall (?obj2 - object) (when (not (= ?obj ?obj2)) (not (robot-at-object ?obj2))))
+      (not (robot-at-location home))
+      (not (robot-at-location ready))
+      (not (robot-at-location handover))
     )
   )
+  
+)
 """
 
 
