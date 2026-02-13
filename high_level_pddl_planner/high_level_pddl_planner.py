@@ -66,7 +66,11 @@ FIXED_DOMAIN = """(define (domain robot-manipulation)
   (:action move_to_home
     :parameters ()
     :precondition (and)
-    :effect (robot-at home)
+    :effect (and
+      (robot-at home)
+      (not (robot-at ready))
+      (not (robot-at handover))
+    )
   )
   
   (:action move_to_ready
@@ -75,6 +79,17 @@ FIXED_DOMAIN = """(define (domain robot-manipulation)
     :effect (and
       (robot-at ready)
       (not (robot-at home))
+      (not (robot-at handover))
+    )
+  )
+
+  (:action move_to_handover
+    :parameters ()
+    :precondition (robot-at home)
+    :effect (and
+      (robot-at handover)
+      (not (robot-at home))
+      (not (robot-at ready))
     )
   )
   
@@ -176,6 +191,7 @@ class Ros2HighLevelAgentNode(Node):
         # State query service clients
         self.is_home_client = self.create_client(GetSetBool, "/is_home")
         self.is_ready_client = self.create_client(GetSetBool, "/is_ready")
+        self.is_handover_client = self.create_client(GetSetBool, "/is_handover")
         self.gripper_is_open_client = self.create_client(GetSetBool, "/gripper_is_open")
 
         self._tools_called: List[str] = []
@@ -244,11 +260,13 @@ class Ros2HighLevelAgentNode(Node):
         
         is_home = self._query_state(self.is_home_client, "/is_home")
         is_ready = self._query_state(self.is_ready_client, "/is_ready")
+        is_handover = self._query_state(self.is_handover_client, "/is_handover")
         gripper_open = self._query_state(self.gripper_is_open_client, "/gripper_is_open")
         
         # Default to reasonable values if services fail
         state['robot_at_home'] = is_home if is_home is not None else False
         state['robot_at_ready'] = is_ready if is_ready is not None else False
+        state['robot_in_handover'] = is_handover if is_handover is not None else False
         state['gripper_open'] = gripper_open if gripper_open is not None else True
         state['gripper_closed'] = not state['gripper_open']
         
