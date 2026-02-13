@@ -31,3 +31,6 @@ build/
 .DS_Store
 
 fastdownward/
+
+generate/api_keys.csv
+generate/instructions.csv

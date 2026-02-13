@@ -1,0 +1,6 @@
+id,instruction
+1,Move the robot to the ready position
+2,Pick up the red cup from the table
+3,Place the object at the handover location
+4,Open the gripper and move to home
+5,Navigate to the left side and grasp the bottle
