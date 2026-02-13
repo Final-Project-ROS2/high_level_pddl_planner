@@ -119,6 +119,29 @@ FIXED_DOMAIN = """(define (domain robot-manipulation)
       (not (robot-at ready))
     )
   )
+
+  (:action move_to_object
+    :parameters (?obj - object)
+    :precondition (and)
+    :effect (and
+      (robot-at ?obj)
+      (not (robot-at home))
+      (not (robot-at ready))
+      (not (robot-at handover))
+    )
+  )
+
+  (:action pick_object
+    :parameters (?obj - object)
+    :precondition (and
+      (robot-at ready)
+    )
+    :effect (and
+      (gripper-closed)
+      (robot-at ?obj)
+      (not (robot-at ready))
+    )
+  )
 """
 
 
