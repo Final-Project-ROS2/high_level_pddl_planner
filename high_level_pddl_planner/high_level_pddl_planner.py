@@ -630,7 +630,7 @@ Current Robot State:
             except Exception as e:
                 return f"ERROR in detect_objects: {e}"
 
-        tools.append(detect_objects)
+        # tools.append(detect_objects)
 
         @tool
         def classify_all() -> str:
@@ -651,7 +651,7 @@ Current Robot State:
             except Exception as e:
                 return f"ERROR in classify_all: {e}"
 
-        tools.append(classify_all)
+        # tools.append(classify_all)
 
         @tool
         def understand_scene() -> str:
@@ -679,7 +679,7 @@ Current Robot State:
             except Exception as e:
                 return f"ERROR in understand_scene: {e}"
 
-        tools.append(understand_scene)
+        # tools.append(understand_scene)
 
         return tools
 
@@ -690,7 +690,6 @@ Current Robot State:
         """Create an agent that generates PDDL domain and problem files."""
         system_message = f"""You are a PDDL domain and problem generator for a robot planning system.
 
-        You have access to vision tools to understand the scene (detect_objects, classify_all, understand_scene).
         The current robot state will be provided in the user message.
 
         Below is a TEMPLATE DOMAIN with predefined actions. You should use this as a starting point:
@@ -706,9 +705,10 @@ Current Robot State:
         - Goal state that achieves the user's instruction
 
         IMPORTANT GUIDELINES:
-        - Prefer using a modified domain whenever possible
+        - Remember that PDDL uses the CLOSED-WORLD ASSUMPTION: anything not stated as true in the initial state is false. You DON'T need to explicitly negate predicates
+        - When instructed to "handover" an object, the goal should be to have the robot at the "handover" location WITH the object IN hand
+        - Prefer using the unmodified domain whenever possible
         - You can create new actions if necessary
-        - The robot can move to a given object, generate move_to_<object> actions as needed
         - DO NOT modify the actions name or parameters
         - Always ensure domain and problem are compatible
 
