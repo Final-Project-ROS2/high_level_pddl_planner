@@ -373,6 +373,16 @@ Current Robot State:
             final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
             self.get_logger().info(f"Agent output (raw):\n{final_text}")
 
+            # If the agent is asking a clarifying question (prefixed with NORMAL), just relay it
+            final_text_stripped = final_text.strip()
+            if final_text_stripped.upper().startswith("NORMAL"):
+                clarification = final_text_stripped[len("NORMAL"):].lstrip(" :")
+                clarification = clarification or final_text_stripped
+                self.get_logger().info(f"Agent requests clarification: {clarification}")
+                self.chat_history.append({"role": "assistant", "content": clarification})
+                self.response_pub.publish(String(data=clarification))
+                return []
+
             self.chat_history.append({"role": "assistant", "content": final_text})
 
             self.response_pub.publish(String(data="Generating PDDL problem file"))
@@ -644,6 +654,7 @@ Current Robot State:
         - Goal state that achieves the user's instruction
 
         IMPORTANT GUIDELINES:
+        - If the instruction is unclear, ask clarifying questions before proceeding.
         - You have access to vision tools like 'vqa' to inspect the scene. You can ask visual questions to gather information about the environment.
         - Use 'vqa' to find objects, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object
         - Remember that PDDL uses the CLOSED-WORLD ASSUMPTION: anything not stated as true in the initial state is false. You DON'T need to explicitly negate predicates
@@ -653,7 +664,9 @@ Current Robot State:
         - DO NOT modify the actions name or parameters
         - Always ensure domain and problem are compatible
 
-        Follow this format exactly:
+        When you need to ask a clarifying question, prefix the entire response with the token NORMAL and include only the clarifying question. Do not generate PDDL in that case. All other planning responses should NOT start with NORMAL.
+
+        Follow this format exactly for planning responses:
         REASONING:
         [Explain your approach and any domain modifications]
 
