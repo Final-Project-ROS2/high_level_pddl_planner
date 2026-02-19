@@ -220,13 +220,8 @@ class Ros2HighLevelAgentNode(Node):
         # Medium-level action client
         self.medium_level_client = ActionClient(self, Prompt, "/medium_level")
 
-        # Vision service clients
-        self.vision_detect_objects_client = self.create_client(DetectObjects, "/vision/detect_objects")
-        self.vision_classify_all_client = self.create_client(Trigger, "/vision/classify_all")
-        self.vision_classify_bb_client = self.create_client(ClassifyBBox, "/vision/classify_bb")
-        self.vision_detect_grasp_client = self.create_client(DetectGrasps, "/vision/detect_grasp")
-        self.vision_detect_grasp_bb_client = self.create_client(DetectGraspBBox, "/vision/detect_grasp_bb")
-        self.vision_understand_scene_client = self.create_client(UnderstandScene, "/vision/understand_scene")
+        # Vision clients
+        self.vision_vqa_client = ActionClient(self, Prompt, "/vqa")
 
         # State query service clients
         self.is_home_client = self.create_client(GetSetBool, "/is_home")
@@ -594,92 +589,36 @@ Current Robot State:
     # -----------------------
     def _initialize_tools(self) -> List[BaseTool]:
         tools: List[BaseTool] = []
-
+        
         @tool
-        def detect_objects(image_hint: Optional[str] = "") -> str:
-            """Call /vision/detect_objects to get bounding boxes."""
-            tool_name = "detect_objects"
-            with self._tools_called_lock:
-                self._tools_called.append(tool_name)
-
-            try:
-                if not self.vision_detect_objects_client.wait_for_service(timeout_sec=5.0):
-                    return "Service /vision/detect_objects unavailable"
-                req = DetectObjects.Request()
-                future = self.vision_detect_objects_client.call_async(req)
-                rclpy.spin_until_future_complete(self, future)
-                resp = future.result()
-                if resp is None:
-                    return "No response from /vision/detect_objects"
-                if not resp.success:
-                    return f"detect_objects failed: {resp.error_message or 'unknown error'}"
-                total = int(resp.total_detections)
-                items = []
-                N = min(total, 4)
-                for i in range(N):
-                    oid = resp.object_ids[i] if i < len(resp.object_ids) else f"obj_{i}"
-                    x1 = resp.bbox_x1[i] if i < len(resp.bbox_x1) else -1
-                    y1 = resp.bbox_y1[i] if i < len(resp.bbox_y1) else -1
-                    x2 = resp.bbox_x2[i] if i < len(resp.bbox_x2) else -1
-                    y2 = resp.bbox_y2[i] if i < len(resp.bbox_y2) else -1
-                    conf = resp.confidences[i] if i < len(resp.confidences) else 0.0
-                    dist = resp.distances_cm[i] if i < len(resp.distances_cm) else -1.0
-                    items.append(f"{oid} bbox=[{x1},{y1},{x2},{y2}] conf={conf:.2f} dist_cm={dist:.1f}")
-                summary = f"Detected {total} objects. Examples: " + "; ".join(items) if items else f"Detected {total} objects."
-                return summary
-            except Exception as e:
-                return f"ERROR in detect_objects: {e}"
-
-        # tools.append(detect_objects)
-
-        @tool
-        def classify_all() -> str:
-            """Trigger /vision/classify_all."""
-            tool_name = "classify_all"
+        def vqa(question: str) -> str:
+            """
+            Call /vqa which returns an answer to a visual question.
+            """
+            tool_name = "vqa"
             with self._tools_called_lock:
                 self._tools_called.append(tool_name)
             try:
-                if not self.vision_classify_all_client.wait_for_service(timeout_sec=5.0):
-                    return "Service /vision/classify_all unavailable"
-                req = Trigger.Request()
-                future = self.vision_classify_all_client.call_async(req)
-                rclpy.spin_until_future_complete(self, future)
-                resp = future.result()
-                if resp is None:
-                    return "No response from /vision/classify_all"
-                return f"classify_all: success={resp.success}, message={resp.message}"
+                if not self.vision_vqa_client.wait_for_server(timeout_sec=5.0):
+                    self.get_logger().error("/vqa action server unavailable")
+                    return None
+                goal = Prompt.Goal()
+                goal.prompt = question
+                send_future = self.vision_vqa_client.send_goal_async(goal)
+                rclpy.spin_until_future_complete(self, send_future)
+                goal_handle = send_future.result()
+                if not goal_handle.accepted:
+                    self.get_logger().error("VQA goal rejected")
+                    return None
+                result_future = goal_handle.get_result_async()
+                rclpy.spin_until_future_complete(self, result_future)
+                result = result_future.result().result
+                return result
             except Exception as e:
-                return f"ERROR in classify_all: {e}"
+                self.get_logger().error(f"Exception when sending to VQA: {e}")
+                return None
 
-        # tools.append(classify_all)
-
-        @tool
-        def understand_scene() -> str:
-            """Call /vision/understand_scene for scene understanding."""
-            tool_name = "understand_scene"
-            with self._tools_called_lock:
-                self._tools_called.append(tool_name)
-            try:
-                if not self.vision_understand_scene_client.wait_for_service(timeout_sec=5.0):
-                    return "Service /vision/understand_scene unavailable"
-                req = UnderstandScene.Request()
-                future = self.vision_understand_scene_client.call_async(req)
-                rclpy.spin_until_future_complete(self, future)
-                resp = future.result()
-                if resp is None:
-                    return "No response from /vision/understand_scene"
-                if not resp.success:
-                    return f"understand_scene failed: {resp.error_message or 'unknown'}"
-                summary = getattr(resp.scene, "scene_description", None)
-                if summary:
-                    return f"scene_summary: {summary}"
-                total_objects = getattr(resp.scene, "total_objects", None)
-                labels = getattr(resp.scene, "object_labels", None)
-                return f"scene_summary: total_objects={total_objects}, labels={labels}"
-            except Exception as e:
-                return f"ERROR in understand_scene: {e}"
-
-        # tools.append(understand_scene)
+        tools.append(vqa)
 
         return tools
 
@@ -705,6 +644,8 @@ Current Robot State:
         - Goal state that achieves the user's instruction
 
         IMPORTANT GUIDELINES:
+        - You have access to vision tools like 'vqa' to inspect the scene. You can ask visual questions to gather information about the environment.
+        - Use 'vqa' to find objects, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object
         - Remember that PDDL uses the CLOSED-WORLD ASSUMPTION: anything not stated as true in the initial state is false. You DON'T need to explicitly negate predicates
         - When instructed to "handover" an object, the goal should be to have the robot at the "handover" location WITH the object IN hand
         - Prefer using the unmodified domain whenever possible
