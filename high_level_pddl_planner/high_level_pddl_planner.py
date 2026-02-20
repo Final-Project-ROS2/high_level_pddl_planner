@@ -60,6 +60,7 @@ FIXED_DOMAIN = """
   (:predicates
     (robot-at-location ?loc - location)
     (robot-at-object ?obj - object)
+    (object-at-location ?obj - object ?loc - location)
     (robot-have ?obj - object)
     (gripper-open)
     (gripper-closed)
@@ -157,7 +158,19 @@ FIXED_DOMAIN = """
       (not (robot-at-location handover))
     )
   )
-  
+
+  (:action place-object
+    :parameters (?obj - object ?place - location)
+    :precondition (and
+      (robot-have ?obj)
+    )
+    :effect (and
+      (robot-at-location ?place)
+      (not (robot-have ?obj))
+      (forall (?obj2 - object) (when (not (= ?obj ?obj2)) (not (robot-at-object ?obj2))))
+      (object-at-location ?obj ?place)
+    )
+  )
 )
 """
 
