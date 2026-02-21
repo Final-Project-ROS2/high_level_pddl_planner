@@ -344,9 +344,13 @@ class Ros2HighLevelAgentNode(Node):
                 return
 
             result = result_container[0].result
-            
+            scene_response = None
+            if result is not None:
+                # Extract only the textual response from the action result
+                scene_response = getattr(result, "final_response", None) or str(result)
+
             with self._init_lock:
-                self.scene_description = result if result else "Scene description unavailable"
+                self.scene_description = scene_response if scene_response else "Scene description unavailable"
                 scene_desc = self.scene_description
             self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_desc)
             with self._init_lock:
@@ -774,6 +778,7 @@ Current Robot State:
 
         IMPORTANT GUIDELINES:
         - If the instruction is unclear, RESPONSE with a clarifying questions before proceeding.
+        - When you need to RESPONSE with a clarifying question, prefix the entire response with the token NORMAL and include only the clarifying question. Do not generate PDDL in that case. All other planning responses should NOT start with NORMAL.
         - You have access to vision tools like 'vqa' to inspect the scene. You can ask visual questions to gather information about the environment.
         - Use 'vqa' to find objects, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object
         - Remember that PDDL uses the CLOSED-WORLD ASSUMPTION: anything not stated as true in the initial state is false. You DON'T need to explicitly negate predicates
@@ -782,8 +787,6 @@ Current Robot State:
         - You can create new actions if necessary
         - DO NOT modify the actions name or parameters
         - Always ensure domain and problem are compatible
-
-        When you need to ask a clarifying question, prefix the entire response with the token NORMAL and include only the clarifying question. Do not generate PDDL in that case. All other planning responses should NOT start with NORMAL.
 
         Follow this format exactly for planning responses:
         REASONING:
