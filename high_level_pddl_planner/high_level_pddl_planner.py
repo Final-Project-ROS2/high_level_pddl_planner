@@ -197,6 +197,11 @@ class Ros2HighLevelAgentNode(Node):
         super().__init__("ros2_high_level_agent_pddl")
         self.get_logger().info("Initializing Ros2 High-Level Agent Node (Fixed PDDL Domain)...")
 
+        # Initialization flag: will be set to True after scene description is obtained
+        self.initialized = False
+        self.scene_description: Optional[str] = None
+        self._init_lock = threading.Lock()
+
         self.declare_parameter("real_hardware", False)
         self.real_hardware: bool = self.get_parameter("real_hardware").get_parameter_value().bool_value
         self.declare_parameter("use_ollama", False)
@@ -248,7 +253,7 @@ class Ros2HighLevelAgentNode(Node):
         self._tools_called_lock = threading.Lock()
 
         self.tools = self._initialize_tools()
-        self.agent_executor = self._create_pddl_agent_executor()
+        self.agent_executor: Optional[AgentExecutor] = None  # Will be created after scene description is ready
 
         self.chat_history: List[Dict[str, str]] = []
         self.latest_plan: Optional[List[str]] = None
@@ -268,7 +273,12 @@ class Ros2HighLevelAgentNode(Node):
         self.response_pub = self.create_publisher(String, "/response", 10)
         self.benchmark_pub = self.create_publisher(String, "/benchmark_logs", 10)
 
-        self.get_logger().info("Ros2 High-Level Agent Node (Fixed PDDL Domain) ready.")
+        self.get_logger().info("Ros2 High-Level Agent Node initialized. Fetching scene description...")
+
+        init_thread = threading.Thread(target=self._initialize_scene_description, daemon=False)
+        init_thread.start()
+
+        self.get_logger().info("Ros2 High-Level Agent Node ready (waiting for scene description before accepting requests).")
 
     def _benchmark_log(self, label: str):
         t = self.get_clock().now()
@@ -276,6 +286,103 @@ class Ros2HighLevelAgentNode(Node):
         self.benchmark_pub.publish(
             String(data=f"{label},{t_sec:.9f}")
         )
+    
+    def _initialize_scene_description(self):
+        """
+        Fetch the initial scene description from /vqa action.
+        Sets self.initialized to True once complete.
+        """
+        try:
+            self.get_logger().info("Waiting for /vqa action server...")
+            if not self.vision_vqa_client.wait_for_server(timeout_sec=30.0):
+                self.get_logger().error("/vqa action server unavailable after 30 seconds. Node will not initialize.")
+                with self._init_lock:
+                    self.scene_description = "Scene not available"
+                    scene_desc = self.scene_description
+                self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_desc)
+                with self._init_lock:
+                    self.initialized = True
+                return
+            
+            self.get_logger().info("Calling /vqa to describe the scene...")
+            goal = Prompt.Goal()
+            goal.prompt = "Describe the scene, including what object exists and how many of each object"
+
+            goal_event = threading.Event()
+            result_event = threading.Event()
+            goal_handle_container = [None]
+            result_container = [None]
+
+            def goal_response_callback(future):
+                goal_handle_container[0] = future.result()
+                goal_event.set()
+            
+            def result_callback(future):
+                result_container[0] = future.result()
+                result_event.set()
+            
+            send_future = self.vision_vqa_client.send_goal_async(goal)
+            send_future.add_done_callback(goal_response_callback)
+
+            if not goal_event.wait(timeout=30.0):
+                self.get_logger().error("Timeout waiting for VQA goal acceptance")
+                with self._init_lock:
+                    self.scene_description = "Scene description unavailable"
+                    scene_desc = self.scene_description
+                self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_desc)
+                with self._init_lock:
+                    self.initialized = True
+                return
+            
+            goal_handle = goal_handle_container[0]
+            if not goal_handle.accepted:
+                self.get_logger().error("VQA goal rejected during scene initialization")
+                with self._init_lock:
+                    self.scene_description = "Scene description unavailable"
+                    scene_desc = self.scene_description
+                self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_desc)
+                with self._init_lock:
+                    self.initialized = True
+                return
+            
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(result_callback)
+
+            if not result_event.wait(timeout=60.0):
+                self.get_logger().error("Timeout waiting for VQA result")
+                with self._init_lock:
+                    self.scene_description = "Scene description unavailable"
+                    scene_desc = self.scene_description
+                self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_desc)
+                with self._init_lock:
+                    self.initialized = True
+                return
+
+            result = result_container[0].result
+            scene_response = None
+            if result is not None:
+                # Extract only the textual response from the action result
+                scene_response = getattr(result, "final_response", None) or str(result)
+
+            with self._init_lock:
+                self.scene_description = scene_response if scene_response else "Scene description unavailable"
+                scene_desc = self.scene_description
+            self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_desc)
+            with self._init_lock:
+                self.initialized = True
+            
+            self.get_logger().info(f"Scene description obtained: {self.scene_description}")
+            self.response_pub.publish(String(data=f"Scene analysis: {self.scene_description}"))
+            
+        except Exception as e:
+            self.get_logger().error(f"Exception during scene initialization: {e}")
+            with self._init_lock:
+                self.scene_description = "Scene description unavailable"
+                scene_desc = self.scene_description
+            self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_desc)
+            with self._init_lock:
+                self.initialized = True
+
 
     # -----------------------
     # State query helpers
@@ -330,6 +437,10 @@ class Ros2HighLevelAgentNode(Node):
         text = msg.data.strip()
         if not text:
             return
+
+        if not self.initialized:
+            self.get_logger().warn("Node not fullly initialized yet. Ignoring transcript.")
+            self.response_pub.publish(String(data="Still initializing, please wait a moment..."))
 
         start_time = time.perf_counter()
         self._benchmark_log("transcript_received")
@@ -498,6 +609,12 @@ Current Robot State:
 
     def confirm_service_callback(self, request, response):
         """Execute the latest plan when confirmed."""
+        if not self.initialized:
+            response.success = False
+            response.message = "Node not yet initialized. Please wait for scene analysis to complete."
+            self.response_pub.publish(String(data=response.message))
+            return response
+
         if not self.latest_plan:
             response.success = False
             response.message = "No plan to confirm. Please give a new instruction first."
@@ -650,11 +767,17 @@ Current Robot State:
     # -----------------------
     # Create PDDL agent
     # -----------------------
-    def _create_pddl_agent_executor(self) -> AgentExecutor:
+    def _create_pddl_agent_executor(self, scene_desc: Optional[str] = None) -> AgentExecutor:
         """Create an agent that generates PDDL domain and problem files."""
+        if scene_desc is None:
+            with self._init_lock:
+                scene_desc = self.scene_description if self.scene_description else "Scene not yet analyzed"
+
         system_message = f"""You are a PDDL domain and problem generator for a robot planning system.
 
         The current robot state will be provided in the user message.
+
+        Current scene description: {scene_desc}
 
         Below is a TEMPLATE DOMAIN with predefined actions. You should use this as a starting point:
 
@@ -669,7 +792,8 @@ Current Robot State:
         - Goal state that achieves the user's instruction
 
         IMPORTANT GUIDELINES:
-        - If the instruction is unclear, ask clarifying questions before proceeding.
+        - If the instruction is unclear, RESPONSE with a clarifying questions before proceeding.
+        - When you need to RESPONSE with a clarifying question, prefix the entire response with the token NORMAL and include only the clarifying question. Do not generate PDDL in that case. All other planning responses should NOT start with NORMAL.
         - You have access to vision tools like 'vqa' to inspect the scene. You can ask visual questions to gather information about the environment.
         - Use 'vqa' to find objects, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object
         - Remember that PDDL uses the CLOSED-WORLD ASSUMPTION: anything not stated as true in the initial state is false. You DON'T need to explicitly negate predicates
@@ -678,8 +802,6 @@ Current Robot State:
         - You can create new actions if necessary
         - DO NOT modify the actions name or parameters
         - Always ensure domain and problem are compatible
-
-        When you need to ask a clarifying question, prefix the entire response with the token NORMAL and include only the clarifying question. Do not generate PDDL in that case. All other planning responses should NOT start with NORMAL.
 
         Follow this format exactly for planning responses:
         REASONING:
@@ -709,6 +831,9 @@ Current Robot State:
     # Action server callbacks
     # -----------------------
     def goal_callback(self, goal_request) -> GoalResponse:
+        if not self.initialized:
+            self.get_logger().warn("[high-level action] Goal received but node not initialized yet.")
+            return GoalResponse.REJECT
         self.get_logger().info(f"[high-level action] Received goal: {getattr(goal_request, 'prompt', '')}")
         with self._tools_called_lock:
             self._tools_called = []
@@ -722,6 +847,8 @@ Current Robot State:
         """Execute incoming high-level Prompt action."""
         self.start_time = time.perf_counter()
         self._benchmark_log("action_goal_received")
+
+        self.get_logger().info(f"Current scene description: {self.scene_description}")
 
         prompt_text = goal_handle.request.prompt
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
