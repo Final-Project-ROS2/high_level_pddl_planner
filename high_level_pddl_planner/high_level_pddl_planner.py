@@ -238,7 +238,7 @@ class Ros2HighLevelAgentNode(Node):
         self._tools_called_lock = threading.Lock()
 
         self.tools = self._initialize_tools()
-        self.agent_executor = Optional[AgentExecutor] = None  # Will be created after scene description is ready
+        self.agent_executor: Optional[AgentExecutor] = None  # Will be created after scene description is ready
 
         self.chat_history: List[Dict[str, str]] = []
         self.latest_plan: Optional[List[str]] = None
@@ -303,7 +303,7 @@ class Ros2HighLevelAgentNode(Node):
                 goal_event.set()
             
             def result_callback(future):
-                result_container[0] = future.result().result
+                result_container[0] = future.result()
                 result_event.set()
             
             send_future = self.vision_vqa_client.send_goal_async(goal)
@@ -773,7 +773,7 @@ Current Robot State:
         - Goal state that achieves the user's instruction
 
         IMPORTANT GUIDELINES:
-        - If the instruction is unclear, ask clarifying questions before proceeding.
+        - If the instruction is unclear, RESPONSE with a clarifying questions before proceeding.
         - You have access to vision tools like 'vqa' to inspect the scene. You can ask visual questions to gather information about the environment.
         - Use 'vqa' to find objects, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object
         - Remember that PDDL uses the CLOSED-WORLD ASSUMPTION: anything not stated as true in the initial state is false. You DON'T need to explicitly negate predicates
@@ -829,6 +829,8 @@ Current Robot State:
         """Execute incoming high-level Prompt action."""
         self.start_time = time.perf_counter()
         self._benchmark_log("action_goal_received")
+
+        self.get_logger().info(f"Current scene description: {self.scene_description}")
 
         prompt_text = goal_handle.request.prompt
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
