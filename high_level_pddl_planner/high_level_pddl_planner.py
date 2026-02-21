@@ -209,7 +209,7 @@ class Ros2HighLevelAgentNode(Node):
         self.declare_parameter("confirm", True)
         self.confirm: bool = self.get_parameter("confirm").get_parameter_value().bool_value
 
-        self.declare_parameter("ollama_model", "qwen3:8b")
+        self.declare_parameter("ollama_model", "gpt-oss:20b")
         self.ollama_model: str = self.get_parameter("ollama_model").get_parameter_value().string_value
         # -----------------------------
         # LLM Selection: Gemini or Ollama
@@ -348,7 +348,7 @@ class Ros2HighLevelAgentNode(Node):
             result_future = goal_handle.get_result_async()
             result_future.add_done_callback(result_callback)
 
-            if not result_event.wait(timeout=60.0):
+            if not result_event.wait(timeout=120.0):
                 self.get_logger().error("Timeout waiting for VQA result")
                 with self._init_lock:
                     self.scene_description = "Scene description unavailable"
@@ -785,7 +785,7 @@ Current Robot State:
 
         Your task is to:
         1. Review the template domain above
-        2. Modify it (e.g., if you need additional predicates, types, or action parameters)
+        2. Modify it ONLY if necessary (e.g., if you need additional predicates, types, or action parameters)
         3. Generate a corresponding PROBLEM file with:
         - Object definitions (include directions: left, right, up, down, forward, backward as direction objects)
         - Initial state based on the provided current robot state
@@ -796,12 +796,10 @@ Current Robot State:
         - When you need to RESPONSE with a clarifying question, prefix the entire response with the token NORMAL and include only the clarifying question. Do not generate PDDL in that case. All other planning responses should NOT start with NORMAL.
         - You have access to vision tools like 'vqa' to inspect the scene. You can ask visual questions to gather information about the environment.
         - Use 'vqa' to find objects, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object
+        - If the instruction specify an existing object, no need to use 'vqa'
         - Remember that PDDL uses the CLOSED-WORLD ASSUMPTION: anything not stated as true in the initial state is false. You DON'T need to explicitly negate predicates
         - When instructed to "handover" an object, the goal should be to have the robot at the "handover" location WITH the object IN hand
         - Prefer using the unmodified domain whenever possible
-        - You can create new actions if necessary
-        - DO NOT modify the actions name or parameters
-        - Always ensure domain and problem are compatible
 
         Follow this format exactly for planning responses:
         REASONING:
