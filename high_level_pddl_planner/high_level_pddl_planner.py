@@ -204,6 +204,8 @@ class Ros2HighLevelAgentNode(Node):
         self.declare_parameter("confirm", True)
         self.confirm: bool = self.get_parameter("confirm").get_parameter_value().bool_value
 
+        self.declare_parameter("ollama_model", "qwen3:8b")
+        self.ollama_model: str = self.get_parameter("ollama_model").get_parameter_value().string_value
         # -----------------------------
         # LLM Selection: Gemini or Ollama
         # -----------------------------
@@ -211,7 +213,7 @@ class Ros2HighLevelAgentNode(Node):
             self.get_logger().info("Using local LLM via Ollama.")
             # Example: using llama3.1 or any model installed in `ollama list`
             self.llm = ChatOllama(
-                model="gpt-oss:20b",   # <--- change to any local model you want
+                model=self.ollama_model,
                 temperature=0.0
             )
         else:
@@ -783,7 +785,7 @@ Current Robot State:
     # -----------------------
     # Medium-level communication
     # -----------------------
-    def send_step_to_medium_async(self, step_text: str, timeout: float = 60.0) -> Optional[Prompt.Result]:
+    def send_step_to_medium_async(self, step_text: str, timeout: float = 120.0) -> Optional[Prompt.Result]:
         """Send a step to medium-level action server."""
         try:
             if not self.medium_level_client.wait_for_server(timeout_sec=5.0):
