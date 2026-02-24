@@ -6,6 +6,7 @@ while generating the problem file dynamically based on runtime state queries.
 """
 import os
 import re
+import json
 import tempfile
 import threading
 import time
@@ -35,9 +36,11 @@ from custom_interfaces.srv import (
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool, tool
-from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain.agents import create_agent, AgentExecutor
+from langchain.agents.structured_output import ToolStrategy
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_ollama import ChatOllama
+from pydantic import BaseModel, Field
 
 
 from dotenv import load_dotenv
@@ -47,139 +50,19 @@ load_dotenv(dotenv_path=ENV_PATH)
 
 FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", "./fastdownward/fast-downward.py")
 SAS_PATH_PLAN = "/home/group11/final_project_ws/src/high_level_pddl_planner/sas_plan"
+TRANSFORM_PY = os.getenv("TRANSFORM_PY", "./transform.py")
+TEMPLATE_PROBLEM = os.getenv("TEMPLATE_PROBLEM", "./template_problem.pddl")
+DOMAIN_PDDL = os.getenv("DOMAIN_PDDL", "./domain.pddl")
 
-# Fixed PDDL Domain
-FIXED_DOMAIN = """
-(define (domain robot-manipulation)
-  (:requirements :strips :typing :conditional-effects)
-  
-  (:types
-    location direction object
-  )
-  
-  (:predicates
-    (robot-at-location ?loc - location)
-    (robot-at-object ?obj - object)
-    (object-at-location ?obj - object ?loc - location)
-    (robot-have ?obj - object)
-    (gripper-open)
-    (gripper-closed)
-  )
-  
-  (:action move_to_home
-    :parameters ()
-    :precondition (and)
-    :effect (and
-      (robot-at-location home)
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-      (forall (?obj - object) (not (robot-at-object ?obj)))
-    )
-  )
-  
-  (:action move_to_ready
-    :parameters ()
-    :precondition (and)
-    :effect (and
-      (robot-at-location ready)
-      (not (robot-at-location home))
-      (not (robot-at-location handover))
-      (forall (?obj - object) (not (robot-at-object ?obj)))
-    )
-  )
-
-  (:action move_to_handover
-    :parameters ()
-    :precondition (and)
-    :effect (and
-      (robot-at-location handover)
-      (not (robot-at-location home))
-      (not (robot-at-location ready))
-      (forall (?obj - object) (not (robot-at-object ?obj)))
-    )
-  )
-  
-  (:action open_gripper
-    :parameters ()
-    :precondition (gripper-closed)
-    :effect (and
-      (gripper-open)
-      (not (gripper-closed))
-    )
-  )
-  
-  (:action close_gripper
-    :parameters ()
-    :precondition (gripper-open)
-    :effect (and
-      (gripper-closed)
-      (not (gripper-open))
-    )
-  )
-  
-  (:action move_to_direction
-    :parameters (?dir - direction)
-    :precondition (and)
-    :effect (and
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-      (forall (?obj - object) (not (robot-at-object ?obj)))
-      (not (robot-at-location home))
-      (not (robot-at-location ready))
-    )
-  )
-
-  (:action move_to_object
-    :parameters (?obj - object)
-    :precondition (and
-      (robot-at-location ready)
-    )
-    :effect (and
-      (robot-at-object ?obj)
-      (not (robot-at-location home))
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-    )
-  )
-
-  (:action pick-object
-    :parameters (?obj - object)
-    :precondition (and
-      (robot-at-location ready)
-    )
-    :effect (and
-      (robot-at-object ?obj)
-      (robot-have ?obj)
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-      (forall (?obj2 - object) (when (not (= ?obj ?obj2)) (not (robot-at-object ?obj2))))
-      (not (robot-at-location home))
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-    )
-  )
-
-  (:action place-object
-    :parameters (?obj - object ?place - location)
-    :precondition (and
-      (robot-have ?obj)
-    )
-    :effect (and
-      (robot-at-location ?place)
-      (not (robot-have ?obj))
-      (forall (?obj2 - object) (when (not (= ?obj ?obj2)) (not (robot-at-object ?obj2))))
-      (object-at-location ?obj ?place)
-    )
-  )
-)
-"""
+class PlanningData(BaseModel):
+    """Structured planning data for robot manipulation tasks."""
+    objects: List[str] = Field(description="List of object names involved in the task")
+    goals: List[Dict[str, Any]] = Field(description="List of goal predicates with format {predicate: str, args: List[str]}")
 
 
 class PDDLGenerationResult:
-    def __init__(self, domain_pddl: str, problem_pddl: str, reasoning: str = ""):
-        self.domain_pddl = domain_pddl
-        self.problem_pddl = problem_pddl
-        self.reasoning = reasoning
+    def __init__(self, json_data: Dict[str, Any]):
+        self.json_data = json_data
 
 
 class PlanningResult:
@@ -511,36 +394,57 @@ Current Robot State:
 
             self.chat_history.append({"role": "assistant", "content": final_text})
 
-            self.response_pub.publish(String(data="Generating PDDL problem file"))
+            self.response_pub.publish(String(data="Generating planning data and PDDL problem file"))
 
-            # Parse DOMAIN and PROBLEM from LLM output
-            pddl_gen = self._parse_domain_and_problem_from_text(final_text)
-            if pddl_gen is None:
-                msg = "Hmm... I couldn't generate valid PDDL files. Could you try rephrasing that?"
-                self.get_logger().error("Failed to parse PDDL domain/problem from LLM output.")
+            # The agent output should contain structured_response from the agent executor
+            if not isinstance(agent_resp, dict) or "structured_response" not in agent_resp:
+                msg = "Hmm... I couldn't generate valid planning data. Could you try rephrasing that?"
+                self.get_logger().error("Failed to get structured response from agent.")
                 self.response_pub.publish(String(data=msg))
                 return []
 
-            # Use LLM-generated domain (which may be modified from the template)
-            domain_pddl = pddl_gen.domain_pddl
-            problem_pddl = pddl_gen.problem_pddl
+            structured_data = agent_resp["structured_response"]
             
-            # Store PDDL for reference
-            self.latest_pddl = PDDLGenerationResult(domain_pddl=domain_pddl, problem_pddl=problem_pddl)
+            # structured_data is a PlanningData Pydantic model instance
+            if isinstance(structured_data, PlanningData):
+                json_gen_data = {
+                    "objects": structured_data.objects,
+                    "goals": structured_data.goals
+                }
+            else:
+                # Fallback if it's already a dict
+                json_gen_data = structured_data if isinstance(structured_data, dict) else structured_data.model_dump()
 
-            # Save PDDL to temporary directory
+            # Store JSON for reference
+            json_result = PDDLGenerationResult(json_data=json_gen_data)
+            self.latest_pddl = json_result
+
+            # Save JSON and generate PDDL using transform.py
             tmpdir = tempfile.mkdtemp(prefix="pddl_")
-            domain_path = Path(tmpdir) / "domain.pddl"
+            json_path = Path(tmpdir) / "data.json"
             problem_path = Path(tmpdir) / "problem.pddl"
-            domain_path.write_text(domain_pddl)
-            problem_path.write_text(problem_pddl)
-            self.get_logger().info(f"PDDL files saved to {tmpdir}")
-            self.get_logger().debug(f"Domain:\n{domain_pddl}")
-            self.get_logger().debug(f"Problem:\n{problem_pddl}")
+            
+            # Write JSON data to file
+            json_data = {"data": json_gen_data}
+            json_path.write_text(json.dumps(json_data, indent=2))
+            self.get_logger().info(f"JSON data saved to {json_path}")
+            self.get_logger().debug(f"JSON data:\n{json.dumps(json_data, indent=2)}")
 
-            # Run Fast Downward
+            # Call transform.py to generate problem PDDL
+            self.get_logger().info(f"Calling transform.py to generate problem file...")
+            transform_result = self._run_transform(TEMPLATE_PROBLEM, str(json_path), str(problem_path))
+            
+            if not transform_result or not problem_path.exists():
+                msg = "Failed to generate PDDL problem file. Transform failed."
+                self.get_logger().error("Transform failed or problem file not created.")
+                self.response_pub.publish(String(data=msg))
+                return []
+
+            self.get_logger().debug(f"Problem:\n{problem_path.read_text()}")
+
+            # Run Fast Downward with domain.pddl and generated problem.pddl
             self.response_pub.publish(String(data="Solving the PDDL problem using Fast Downward"))
-            plan_result = self._run_fast_downward(str(domain_path), str(problem_path))
+            plan_result = self._run_fast_downward(DOMAIN_PDDL, str(problem_path))
 
             if start_time is not None:
                 end_time = time.perf_counter()
@@ -653,43 +557,25 @@ Current Robot State:
         return response
 
     # -----------------------
-    # PDDL parsing helpers
+    # JSON and Transform helpers
     # -----------------------
-    def _parse_domain_and_problem_from_text(self, text: str) -> Optional[PDDLGenerationResult]:
-        """Extract DOMAIN and PROBLEM PDDL from LLM output."""
+    def _run_transform(self, template_file: str, data_json_file: str, output_file: str) -> bool:
+        """Call transform.py to generate problem PDDL from template and JSON data."""
+        cmd = ["python3", TRANSFORM_PY, template_file, data_json_file, output_file]
+        self.get_logger().info(f"Calling transform.py: {' '.join(cmd)}")
         try:
-            # Try code fence format first
-            domain_match = re.search(r"DOMAIN:\s*```pddl\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-            problem_match = re.search(r"PROBLEM:\s*```pddl\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-            
-            if domain_match and problem_match:
-                domain = domain_match.group(1).strip()
-                problem = problem_match.group(1).strip()
-                reasoning_match = re.search(r"REASONING:\s*(.*?)(?=DOMAIN:|PROBLEM:|$)", text, re.DOTALL | re.IGNORECASE)
-                reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
-                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning=reasoning)
-
-            # Try simple split
-            if "DOMAIN:" in text and "PROBLEM:" in text:
-                domain_part = text.split("DOMAIN:")[1].split("PROBLEM:")[0].strip()
-                problem_part = text.split("PROBLEM:")[1].strip()
-                domain = domain_part.strip("` \n")
-                problem = problem_part.strip("` \n")
-                reasoning_match = re.search(r"REASONING:\s*(.*?)(?=DOMAIN:|PROBLEM:|$)", text, re.DOTALL | re.IGNORECASE)
-                reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
-                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning=reasoning)
-
-            # Try finding define blocks
-            domain_paren = re.search(r"\(define\s*\(domain.*?\)\)", text, re.DOTALL | re.IGNORECASE)
-            problem_paren = re.search(r"\(define\s*\(problem.*?\)\)", text, re.DOTALL | re.IGNORECASE)
-            if domain_paren and problem_paren:
-                domain = domain_paren.group(0).strip()
-                problem = problem_paren.group(0).strip()
-                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning="")
-                
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            self.get_logger().info(f"Transform stdout:\n{result.stdout}")
+            if result.returncode != 0:
+                self.get_logger().error(f"Transform failed with return code {result.returncode}: {result.stderr}")
+                return False
+            return True
+        except subprocess.TimeoutExpired:
+            self.get_logger().error("Transform timed out")
+            return False
         except Exception as e:
-            self.get_logger().error(f"Error extracting PDDL from text: {e}")
-        return None
+            self.get_logger().error(f"Error calling transform.py: {e}")
+            return False
 
     def _run_fast_downward(self, domain_file: str, problem_file: str, timeout: int = 300) -> PlanningResult:
         """Call Fast Downward to produce a plan."""
@@ -765,55 +651,48 @@ Current Robot State:
         return tools
 
     # -----------------------
-    # Create PDDL agent
+    # Create Planning Agent
     # -----------------------
     def _create_pddl_agent_executor(self, scene_desc: Optional[str] = None) -> AgentExecutor:
-        """Create an agent that generates PDDL domain and problem files."""
+        """Create an agent that generates planning data (objects and goals) in JSON format using structured output."""
         if scene_desc is None:
             with self._init_lock:
                 scene_desc = self.scene_description if self.scene_description else "Scene not yet analyzed"
 
-        system_message = f"""You are a PDDL domain and problem generator for a robot planning system.
+        system_message = f"""You are a planning assistant for a robot manipulation system.
 
         The current robot state will be provided in the user message.
 
         Current scene description: {scene_desc}
 
-        Below is a TEMPLATE DOMAIN with predefined actions. You should use this as a starting point:
+        Your task is to analyze the user's instruction and generate planning data that defines:
+        1. Objects involved in the task (list the specific object names)
+        2. Goal predicates that should be achieved (list the desired states)
 
-        {FIXED_DOMAIN}
+        The planning data format:
+        - objects: List of object names (e.g., ["gear", "bolt"])
+        - goals: List of goal predicates, each with predicate name and arguments
+          Examples:
+          - {{"predicate": "gripper-closed", "args": []}}
+          - {{"predicate": "robot-at-location", "args": ["handover"]}}
+          - {{"predicate": "object-at-location", "args": ["gear", "handover"]}}
+          - {{"predicate": "robot-have", "args": ["gear"]}}
 
-        Your task is to:
-        1. Review the template domain above
-        2. Modify it ONLY if necessary (e.g., if you need additional predicates, types, or action parameters)
-        3. Generate a corresponding PROBLEM file with:
-        - Object definitions (include directions: left, right, up, down, forward, backward as direction objects)
-        - Initial state based on the provided current robot state
-        - Goal state that achieves the user's instruction
+        Common predicates:
+        - gripper-open: Empty args list
+        - gripper-closed: Empty args list
+        - robot-at-location: args = [location_name]
+        - object-at-location: args = [object_name, location_name]
+        - robot-have: args = [object_name]
+
+        Available locations: home, ready, handover
 
         IMPORTANT GUIDELINES:
-        - If the instruction is unclear, RESPONSE with a clarifying questions before proceeding.
-        - When you need to RESPONSE with a clarifying question, prefix the entire response with the token NORMAL and include only the clarifying question. Do not generate PDDL in that case. All other planning responses should NOT start with NORMAL.
-        - You have access to vision tools like 'vqa' to inspect the scene. You can ask visual questions to gather information about the environment.
-        - Use 'vqa' to find objects, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object
-        - If the instruction specify an existing object, no need to use 'vqa'
-        - Remember that PDDL uses the CLOSED-WORLD ASSUMPTION: anything not stated as true in the initial state is false. You DON'T need to explicitly negate predicates
-        - When instructed to "handover" an object, the goal should be to have the robot at the "handover" location WITH the object IN hand
-        - Prefer using the unmodified domain whenever possible
-
-        Follow this format exactly for planning responses:
-        REASONING:
-        [Explain your approach and any domain modifications]
-
-        DOMAIN:
-        ```pddl
-        [domain content - use template or modified version]
-        ```
-
-        PROBLEM:
-        ```pddl
-        [problem content]
-        ```
+        - If the instruction is unclear, respond with a clarifying question only. Prefix with NORMAL and ask the question.
+        - Use vision tools (vqa) to inspect the scene and identify objects if needed.
+        - When asked to "handover" an object, goals should include gripper-closed at handover location.
+        - List all relevant objects in the objects array.
+        - Include all necessary goal predicates for the desired end state.
         """
 
         prompt = ChatPromptTemplate.from_messages([
@@ -822,7 +701,15 @@ Current Robot State:
             ("human", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
-        agent = create_tool_calling_agent(self.llm, self.tools, prompt)
+        
+        # Create agent with structured output
+        agent = create_agent(
+            self.llm,
+            self.tools,
+            prompt,
+            response_format=ToolStrategy(PlanningData, handle_errors=True)
+        )
+        
         return AgentExecutor(agent=agent, tools=self.tools, verbose=True, max_iterations=12)
 
     # -----------------------

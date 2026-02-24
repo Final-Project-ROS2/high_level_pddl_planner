@@ -1,0 +1,8 @@
+{
+  "data": {
+    "objects": ["gear", "bolt"],
+    "goals": [
+      {"predicate": "gripper-closed", "args": []}
+    ]
+  }
+}
