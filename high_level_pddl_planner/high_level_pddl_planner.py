@@ -313,6 +313,26 @@ class Ros2HighLevelAgentNode(Node):
         self.get_logger().info(f"Current state: {state}")
         return state
 
+    def _state_to_init_predicates(self, current_state: Dict[str, bool]) -> List[Dict[str, Any]]:
+        """Convert current state dict to PDDL init predicates for template."""
+        init_predicates = []
+        
+        # Add location predicates
+        if current_state.get('robot_at_home'):
+            init_predicates.append({"predicate": "robot-at-location", "args": ["home"]})
+        if current_state.get('robot_at_ready'):
+            init_predicates.append({"predicate": "robot-at-location", "args": ["ready"]})
+        if current_state.get('robot_in_handover'):
+            init_predicates.append({"predicate": "robot-at-location", "args": ["handover"]})
+        
+        # Add gripper predicates
+        if current_state.get('gripper_open'):
+            init_predicates.append({"predicate": "gripper-open", "args": []})
+        if current_state.get('gripper_closed'):
+            init_predicates.append({"predicate": "gripper-closed", "args": []})
+        
+        return init_predicates
+
     # -----------------------
     # Transcript handling
     # -----------------------
@@ -353,14 +373,8 @@ class Ros2HighLevelAgentNode(Node):
             # Get current state from services
             current_state = self._get_current_state()
             
-            # Build state description for LLM
-            state_description = f"""
-Current Robot State:
-- Robot at home: {current_state['robot_at_home']}
-- Robot at ready: {current_state['robot_at_ready']}
-- Gripper open: {current_state['gripper_open']}
-- Gripper closed: {current_state['gripper_closed']}
-"""
+            # Convert current state to init predicates for PDDL template
+            init_predicates = self._state_to_init_predicates(current_state)
 
             # Build LangChain chat history
             langchain_history = []
@@ -370,12 +384,9 @@ Current Robot State:
                 elif msg["role"] == "assistant":
                     langchain_history.append(AIMessage(content=msg["content"]))
 
-            # Create augmented instruction with state info
-            augmented_instruction = f"{instruction_text}\n\n{state_description}"
-
-            # Invoke agent
+            # Invoke agent with instruction only (state will be in init block)
             agent_resp = self.agent_executor.invoke({
-                "input": augmented_instruction,
+                "input": instruction_text,
                 "chat_history": langchain_history
             })
 
@@ -409,11 +420,13 @@ Current Robot State:
             if isinstance(structured_data, PlanningData):
                 json_gen_data = {
                     "objects": structured_data.objects,
-                    "goals": structured_data.goals
+                    "goals": structured_data.goals,
+                    "init": init_predicates
                 }
             else:
                 # Fallback if it's already a dict
                 json_gen_data = structured_data if isinstance(structured_data, dict) else structured_data.model_dump()
+                json_gen_data["init"] = init_predicates
 
             # Store JSON for reference
             json_result = PDDLGenerationResult(json_data=json_gen_data)
