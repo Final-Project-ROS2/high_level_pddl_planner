@@ -406,6 +406,7 @@ class Ros2HighLevelAgentNode(Node):
                 return []
 
             json_gen_data = {
+                "locations": planning_payload.get("locations", []),
                 "objects": planning_payload.get("objects", []),
                 "goals": planning_payload.get("goals", []),
                 "init": init_predicates,
@@ -652,14 +653,17 @@ class Ros2HighLevelAgentNode(Node):
         if not isinstance(base_data, dict):
             self.get_logger().error("Parsed JSON missing 'data' object")
             return None
-
+        
+        locations = base_data.get("locations", [])
         objects = base_data.get("objects", [])
         goals = base_data.get("goals", [])
 
-        if not isinstance(objects, list) or not isinstance(goals, list):
-            self.get_logger().error("JSON does not contain list fields for objects/goals")
+    
+        if not isinstance(objects, list) or not isinstance(goals, list) or not isinstance(locations, list):
+            self.get_logger().error("JSON does not contain list fields for objects/goals/locations")
             return None
 
+        sanitized_locations = [str(loc).strip() for loc in locations if str(loc).strip()]
         sanitized_objects = [str(obj).strip() for obj in objects if str(obj).strip()]
 
         sanitized_goals: List[Dict[str, Any]] = []
@@ -675,11 +679,11 @@ class Ros2HighLevelAgentNode(Node):
                 "args": [str(arg).strip() for arg in args]
             })
 
-        if not sanitized_objects and not sanitized_goals:
-            self.get_logger().error("Parsed JSON missing both objects and goals")
+        if not sanitized_objects and not sanitized_goals and not sanitized_locations:
+            self.get_logger().error("Parsed JSON missing objects, goals, and locations")
             return None
 
-        return {"objects": sanitized_objects, "goals": sanitized_goals}
+        return {"locations": sanitized_locations, "objects": sanitized_objects, "goals": sanitized_goals}
 
     # -----------------------
     # Tools
@@ -735,11 +739,15 @@ class Ros2HighLevelAgentNode(Node):
         Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
         {{{{
             "data": {{{{
+                "locations": ["left-of-gear"],
                 "objects": ["gear", "bolt"],
                 "goals": [{{{{"predicate": "gripper-close", "args": []}}}}]
             }}}}
         }}}}
-        Where the objects are the objects present in the workspace and the goals are the desired FINAL state.
+        Where
+        - locations are task-specific locations needed to complete the instruction (doesn't include HOME, READY, HANDOVER)
+        - objects are the objects present in the workspace
+        - goals are the desired FINAL state.
         DO NOT put intermediate goals in the goals list.
 
         Requirements:
@@ -749,6 +757,7 @@ class Ros2HighLevelAgentNode(Node):
         - You may call tools like vqa if needed, but the final reply must still be the JSON described.
 
         Predicate hints:
+        - DO NOT create new predicates
         - gripper-open: args []
         - gripper-close: args []
         - robot-at-location: args [location_name]

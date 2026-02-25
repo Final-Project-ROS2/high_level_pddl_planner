@@ -2,7 +2,7 @@
   (:domain robot-manipulation)
 
   (:objects
-    home ready handover - location
+    home ready handover {{ data.locations|join(' ') }} - location
     left right up down forward backward - direction{% if data.objects %}
     {%- for obj in data.objects %}
     {{obj}} - object{% endfor %}
