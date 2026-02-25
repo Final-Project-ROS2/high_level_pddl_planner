@@ -574,10 +574,11 @@ class Ros2HighLevelAgentNode(Node):
     # -----------------------
     def _run_transform(self, template_file: str, data_json_file: str, output_file: str) -> bool:
         """Call transform.py to generate problem PDDL from template and JSON data."""
-        cmd = ["python3", TRANSFORM_PY, template_file, data_json_file, output_file]
-        self.get_logger().info(f"Calling transform.py: {' '.join(cmd)}")
+        workdir = str(Path(template_file).parent)
+        cmd = ["uv", "run", TRANSFORM_PY, template_file, data_json_file, output_file]
+        self.get_logger().info(f"Calling transform.py: {' '.join(cmd)} (workdir={workdir})")
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=60)
             self.get_logger().info(f"Transform stdout:\n{result.stdout}")
             if result.returncode != 0:
                 self.get_logger().error(f"Transform failed with return code {result.returncode}: {result.stderr}")
