@@ -132,8 +132,10 @@ class Ros2HighLevelAgentNode(Node):
         self.chat_history: List[Dict[str, str]] = []
         self.latest_plan: Optional[List[str]] = None
         self.latest_pddl: Optional[PDDLGenerationResult] = None
+        self.last_goal_state: Optional[List[Dict[str, Any]]] = None  # Store goal state from previous successful execution
 
         self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
+        self.reset_state_srv = self.create_service(Trigger, "/reset_state", self.reset_state_callback)
 
         self._action_server = ActionServer(
             self,
@@ -366,6 +368,17 @@ class Ros2HighLevelAgentNode(Node):
             
             # Convert current state to init predicates for PDDL template
             init_predicates = self._state_to_init_predicates(current_state)
+            
+            # Merge with last goal state if available (continuous state tracking)
+            if self.last_goal_state:
+                self.get_logger().info(f"Merging previous goal state into init: {self.last_goal_state}")
+                # Add previous goals to init, avoiding duplicates
+                existing_predicates = {(p["predicate"], tuple(p.get("args", []))): p for p in init_predicates}
+                for goal in self.last_goal_state:
+                    key = (goal["predicate"], tuple(goal.get("args", [])))
+                    if key not in existing_predicates:
+                        init_predicates.append(goal)
+                self.get_logger().info(f"Combined init predicates: {init_predicates}")
 
             # Build LangChain chat history
             langchain_history = []
@@ -451,6 +464,7 @@ class Ros2HighLevelAgentNode(Node):
                 msg = f"I couldn't find a valid plan. The planner returned: {plan_result.status}"
                 self.get_logger().warn(f"Planner returned no plan. status={plan_result.status} rc={plan_result.return_code}")
                 self.response_pub.publish(String(data=msg))
+                # Keep last_goal_state intact - planning failed but state hasn't changed
                 return []
 
             self.get_logger().info("Plan obtained from Fast Downward. Parsing to steps...")
@@ -459,6 +473,7 @@ class Ros2HighLevelAgentNode(Node):
                 msg = "No actionable steps could be parsed from the plan."
                 self.get_logger().warn("No actionable plan lines parsed.")
                 self.response_pub.publish(String(data=msg))
+                # Keep last_goal_state intact - parsing failed but state hasn't changed
                 return []
 
             self.latest_plan = plan_lines
@@ -482,6 +497,8 @@ class Ros2HighLevelAgentNode(Node):
                             msg = f"Step {i} failed: {step}. Stopping execution."
                             self.response_pub.publish(String(data=msg))
                             self.get_logger().error(msg)
+                            # Clear last goal state on execution failure - state is now uncertain after partial execution
+                            self.last_goal_state = None
                             break
                         else:
                             done_msg = f"Step {i} completed successfully."
@@ -492,7 +509,13 @@ class Ros2HighLevelAgentNode(Node):
                     benchmark_info = f"High-level action completed in {end_time - self.start_time:.2f} seconds."
                     self.benchmark_pub.publish(String(data=benchmark_info))
                     self.response_pub.publish(String(data="Plan execution finished."))
-                    self.get_logger().info("All steps done. Clearing chat history and plan.")
+                    self.get_logger().info("All steps done. Storing goal state for continuous tracking.")
+                    
+                    # Store goal state from successfully executed plan for next instruction
+                    if self.latest_pddl and self.latest_pddl.json_data:
+                        self.last_goal_state = self.latest_pddl.json_data.get("goals", [])
+                        self.get_logger().info(f"Stored goal state for next instruction: {self.last_goal_state}")
+                    
                     self.chat_history.clear()
                     self.latest_plan = None
                     self.latest_pddl = None
@@ -505,6 +528,7 @@ class Ros2HighLevelAgentNode(Node):
         except Exception as e:
             self.get_logger().error(f"Error generating plan: {e}")
             self.response_pub.publish(String(data="Sorry, something went wrong while planning."))
+            # Keep last_goal_state intact - planning exception but state hasn't changed
             return []
 
     def confirm_service_callback(self, request, response):
@@ -533,6 +557,8 @@ class Ros2HighLevelAgentNode(Node):
                     msg = f"Step {i} failed: {step}. Stopping execution."
                     self.response_pub.publish(String(data=msg))
                     self.get_logger().error(msg)
+                    # Clear last goal state on execution failure - state is now uncertain after partial execution
+                    self.last_goal_state = None
                     break
                 else:
                     done_msg = f"Step {i} completed successfully."
@@ -540,7 +566,13 @@ class Ros2HighLevelAgentNode(Node):
                     self.get_logger().info(done_msg)
 
             self.response_pub.publish(String(data="Plan execution finished."))
-            self.get_logger().info("All steps done. Clearing chat history and plan.")
+            self.get_logger().info("All steps done. Storing goal state for continuous tracking.")
+            
+            # Store goal state from successfully executed plan for next instruction
+            if self.latest_pddl and self.latest_pddl.json_data:
+                self.last_goal_state = self.latest_pddl.json_data.get("goals", [])
+                self.get_logger().info(f"Stored goal state for next instruction: {self.last_goal_state}")
+            
             self.chat_history.clear()
             self.latest_plan = None
             self.latest_pddl = None
@@ -550,6 +582,19 @@ class Ros2HighLevelAgentNode(Node):
 
         response.success = True
         response.message = "Plan execution started."
+        return response
+
+    def reset_state_callback(self, request, response):
+        """Reset the stored goal state to start fresh."""
+        self.last_goal_state = None
+        self.chat_history.clear()
+        self.latest_plan = None
+        self.latest_pddl = None
+        
+        response.success = True
+        response.message = "State has been reset. Ready for new instructions."
+        self.get_logger().info("State reset via /reset_state service")
+        self.response_pub.publish(String(data=response.message))
         return response
 
     # -----------------------
