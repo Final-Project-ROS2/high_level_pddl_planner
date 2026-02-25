@@ -41,3 +41,6 @@ generate/plans/
 generate/results/
 
 generate/fast-downward/
+
+./sas_plan
+sas_plan

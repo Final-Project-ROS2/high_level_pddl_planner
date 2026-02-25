@@ -6,6 +6,7 @@ while generating the problem file dynamically based on runtime state queries.
 """
 import os
 import re
+import json
 import tempfile
 import threading
 import time
@@ -46,140 +47,13 @@ ENV_PATH = '/home/group11/final_project_ws/src/high_level_pddl_planner/.env'
 load_dotenv(dotenv_path=ENV_PATH)
 
 FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", "./fastdownward/fast-downward.py")
-SAS_PATH_PLAN = "/home/group11/final_project_ws/src/high_level_pddl_planner/sas_plan"
-
-# Fixed PDDL Domain
-FIXED_DOMAIN = """
-(define (domain robot-manipulation)
-  (:requirements :strips :typing :conditional-effects)
-  
-  (:types
-    location direction object
-  )
-  
-  (:predicates
-    (robot-at-location ?loc - location)
-    (robot-at-object ?obj - object)
-    (object-at-location ?obj - object ?loc - location)
-    (robot-have ?obj - object)
-    (gripper-open)
-    (gripper-closed)
-  )
-  
-  (:action move_to_home
-    :parameters ()
-    :precondition (and)
-    :effect (and
-      (robot-at-location home)
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-      (forall (?obj - object) (not (robot-at-object ?obj)))
-    )
-  )
-  
-  (:action move_to_ready
-    :parameters ()
-    :precondition (and)
-    :effect (and
-      (robot-at-location ready)
-      (not (robot-at-location home))
-      (not (robot-at-location handover))
-      (forall (?obj - object) (not (robot-at-object ?obj)))
-    )
-  )
-
-  (:action move_to_handover
-    :parameters ()
-    :precondition (and)
-    :effect (and
-      (robot-at-location handover)
-      (not (robot-at-location home))
-      (not (robot-at-location ready))
-      (forall (?obj - object) (not (robot-at-object ?obj)))
-    )
-  )
-  
-  (:action open_gripper
-    :parameters ()
-    :precondition (gripper-closed)
-    :effect (and
-      (gripper-open)
-      (not (gripper-closed))
-    )
-  )
-  
-  (:action close_gripper
-    :parameters ()
-    :precondition (gripper-open)
-    :effect (and
-      (gripper-closed)
-      (not (gripper-open))
-    )
-  )
-  
-  (:action move_to_direction
-    :parameters (?dir - direction)
-    :precondition (and)
-    :effect (and
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-      (forall (?obj - object) (not (robot-at-object ?obj)))
-      (not (robot-at-location home))
-      (not (robot-at-location ready))
-    )
-  )
-
-  (:action move_to_object
-    :parameters (?obj - object)
-    :precondition (and
-      (robot-at-location ready)
-    )
-    :effect (and
-      (robot-at-object ?obj)
-      (not (robot-at-location home))
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-    )
-  )
-
-  (:action pick-object
-    :parameters (?obj - object)
-    :precondition (and
-      (robot-at-location ready)
-    )
-    :effect (and
-      (robot-at-object ?obj)
-      (robot-have ?obj)
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-      (forall (?obj2 - object) (when (not (= ?obj ?obj2)) (not (robot-at-object ?obj2))))
-      (not (robot-at-location home))
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-    )
-  )
-
-  (:action place-object
-    :parameters (?obj - object ?place - location)
-    :precondition (and
-      (robot-have ?obj)
-    )
-    :effect (and
-      (robot-at-location ?place)
-      (not (robot-have ?obj))
-      (forall (?obj2 - object) (when (not (= ?obj ?obj2)) (not (robot-at-object ?obj2))))
-      (object-at-location ?obj ?place)
-    )
-  )
-)
-"""
-
+TRANSFORM_PY = os.getenv("TRANSFORM_PY", "transform.py")
+TEMPLATE_PROBLEM = os.getenv("TEMPLATE_PROBLEM", "./template_problem.pddl")
+DOMAIN_PDDL = os.getenv("DOMAIN_PDDL", "./domain.pddl")
 
 class PDDLGenerationResult:
-    def __init__(self, domain_pddl: str, problem_pddl: str, reasoning: str = ""):
-        self.domain_pddl = domain_pddl
-        self.problem_pddl = problem_pddl
-        self.reasoning = reasoning
+    def __init__(self, json_data: Dict[str, Any]):
+        self.json_data = json_data
 
 
 class PlanningResult:
@@ -294,8 +168,8 @@ class Ros2HighLevelAgentNode(Node):
         """
         try:
             self.get_logger().info("Waiting for /vqa action server...")
-            if not self.vision_vqa_client.wait_for_server(timeout_sec=30.0):
-                self.get_logger().error("/vqa action server unavailable after 30 seconds. Node will not initialize.")
+            if not self.vision_vqa_client.wait_for_server(timeout_sec=120.0):
+                self.get_logger().error("/vqa action server unavailable after 120 seconds. Node will not initialize.")
                 with self._init_lock:
                     self.scene_description = "Scene not available"
                     scene_desc = self.scene_description
@@ -425,10 +299,30 @@ class Ros2HighLevelAgentNode(Node):
         state['robot_at_ready'] = is_ready if is_ready is not None else False
         state['robot_in_handover'] = is_handover if is_handover is not None else False
         state['gripper_open'] = gripper_open if gripper_open is not None else True
-        state['gripper_closed'] = not state['gripper_open']
+        state['gripper_close'] = not state['gripper_open']
         
         self.get_logger().info(f"Current state: {state}")
         return state
+
+    def _state_to_init_predicates(self, current_state: Dict[str, bool]) -> List[Dict[str, Any]]:
+        """Convert current state dict to PDDL init predicates for template."""
+        init_predicates = []
+        
+        # Add location predicates
+        if current_state.get('robot_at_home'):
+            init_predicates.append({"predicate": "robot-at-location", "args": ["home"]})
+        if current_state.get('robot_at_ready'):
+            init_predicates.append({"predicate": "robot-at-location", "args": ["ready"]})
+        if current_state.get('robot_in_handover'):
+            init_predicates.append({"predicate": "robot-at-location", "args": ["handover"]})
+        
+        # Add gripper predicates
+        if current_state.get('gripper_open'):
+            init_predicates.append({"predicate": "gripper-open", "args": []})
+        if current_state.get('gripper_close'):
+            init_predicates.append({"predicate": "gripper-close", "args": []})
+        
+        return init_predicates
 
     # -----------------------
     # Transcript handling
@@ -470,14 +364,8 @@ class Ros2HighLevelAgentNode(Node):
             # Get current state from services
             current_state = self._get_current_state()
             
-            # Build state description for LLM
-            state_description = f"""
-Current Robot State:
-- Robot at home: {current_state['robot_at_home']}
-- Robot at ready: {current_state['robot_at_ready']}
-- Gripper open: {current_state['gripper_open']}
-- Gripper closed: {current_state['gripper_closed']}
-"""
+            # Convert current state to init predicates for PDDL template
+            init_predicates = self._state_to_init_predicates(current_state)
 
             # Build LangChain chat history
             langchain_history = []
@@ -487,12 +375,9 @@ Current Robot State:
                 elif msg["role"] == "assistant":
                     langchain_history.append(AIMessage(content=msg["content"]))
 
-            # Create augmented instruction with state info
-            augmented_instruction = f"{instruction_text}\n\n{state_description}"
-
-            # Invoke agent
+            # Invoke agent with instruction only (state will be in init block)
             agent_resp = self.agent_executor.invoke({
-                "input": augmented_instruction,
+                "input": instruction_text,
                 "chat_history": langchain_history
             })
 
@@ -511,36 +396,51 @@ Current Robot State:
 
             self.chat_history.append({"role": "assistant", "content": final_text})
 
-            self.response_pub.publish(String(data="Generating PDDL problem file"))
+            self.response_pub.publish(String(data="Generating planning data and PDDL problem file"))
 
-            # Parse DOMAIN and PROBLEM from LLM output
-            pddl_gen = self._parse_domain_and_problem_from_text(final_text)
-            if pddl_gen is None:
-                msg = "Hmm... I couldn't generate valid PDDL files. Could you try rephrasing that?"
-                self.get_logger().error("Failed to parse PDDL domain/problem from LLM output.")
+            planning_payload = self._parse_planning_json(final_text)
+            if not planning_payload:
+                msg = "Hmm... I couldn't generate valid planning data. Could you try rephrasing that?"
+                self.get_logger().error("LLM response could not be parsed into planning JSON.")
                 self.response_pub.publish(String(data=msg))
                 return []
 
-            # Use LLM-generated domain (which may be modified from the template)
-            domain_pddl = pddl_gen.domain_pddl
-            problem_pddl = pddl_gen.problem_pddl
-            
-            # Store PDDL for reference
-            self.latest_pddl = PDDLGenerationResult(domain_pddl=domain_pddl, problem_pddl=problem_pddl)
+            json_gen_data = {
+                "objects": planning_payload.get("objects", []),
+                "goals": planning_payload.get("goals", []),
+                "init": init_predicates,
+            }
 
-            # Save PDDL to temporary directory
+            # Store JSON for reference
+            json_result = PDDLGenerationResult(json_data=json_gen_data)
+            self.latest_pddl = json_result
+
+            # Save JSON and generate PDDL using transform.py
             tmpdir = tempfile.mkdtemp(prefix="pddl_")
-            domain_path = Path(tmpdir) / "domain.pddl"
+            json_path = Path(tmpdir) / "data.json"
             problem_path = Path(tmpdir) / "problem.pddl"
-            domain_path.write_text(domain_pddl)
-            problem_path.write_text(problem_pddl)
-            self.get_logger().info(f"PDDL files saved to {tmpdir}")
-            self.get_logger().debug(f"Domain:\n{domain_pddl}")
-            self.get_logger().debug(f"Problem:\n{problem_pddl}")
+            
+            # Write JSON data to file
+            json_data = {"data": json_gen_data}
+            json_path.write_text(json.dumps(json_data, indent=2))
+            self.get_logger().info(f"JSON data saved to {json_path}")
+            self.get_logger().debug(f"JSON data:\n{json.dumps(json_data, indent=2)}")
 
-            # Run Fast Downward
+            # Call transform.py to generate problem PDDL
+            self.get_logger().info(f"Calling transform.py to generate problem file...")
+            transform_result = self._run_transform(TEMPLATE_PROBLEM, str(json_path), str(problem_path))
+            
+            if not transform_result or not problem_path.exists():
+                msg = "Failed to generate PDDL problem file. Transform failed."
+                self.get_logger().error("Transform failed or problem file not created.")
+                self.response_pub.publish(String(data=msg))
+                return []
+
+            self.get_logger().debug(f"Problem:\n{problem_path.read_text()}")
+
+            # Run Fast Downward with domain.pddl and generated problem.pddl
             self.response_pub.publish(String(data="Solving the PDDL problem using Fast Downward"))
-            plan_result = self._run_fast_downward(str(domain_path), str(problem_path))
+            plan_result = self._run_fast_downward(DOMAIN_PDDL, str(problem_path))
 
             if start_time is not None:
                 end_time = time.perf_counter()
@@ -653,43 +553,27 @@ Current Robot State:
         return response
 
     # -----------------------
-    # PDDL parsing helpers
+    # JSON and Transform helpers
     # -----------------------
-    def _parse_domain_and_problem_from_text(self, text: str) -> Optional[PDDLGenerationResult]:
-        """Extract DOMAIN and PROBLEM PDDL from LLM output."""
+    def _run_transform(self, template_file: str, data_json_file: str, output_file: str) -> bool:
+        """Call transform.py to generate problem PDDL from template and JSON data."""
+        workdir = str(Path(template_file).parent)
+
+        cmd = ["python3", TRANSFORM_PY, template_file, data_json_file, output_file]
+        self.get_logger().info(f"Calling transform.py: {' '.join(cmd)} (workdir={workdir})")
         try:
-            # Try code fence format first
-            domain_match = re.search(r"DOMAIN:\s*```pddl\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-            problem_match = re.search(r"PROBLEM:\s*```pddl\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-            
-            if domain_match and problem_match:
-                domain = domain_match.group(1).strip()
-                problem = problem_match.group(1).strip()
-                reasoning_match = re.search(r"REASONING:\s*(.*?)(?=DOMAIN:|PROBLEM:|$)", text, re.DOTALL | re.IGNORECASE)
-                reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
-                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning=reasoning)
-
-            # Try simple split
-            if "DOMAIN:" in text and "PROBLEM:" in text:
-                domain_part = text.split("DOMAIN:")[1].split("PROBLEM:")[0].strip()
-                problem_part = text.split("PROBLEM:")[1].strip()
-                domain = domain_part.strip("` \n")
-                problem = problem_part.strip("` \n")
-                reasoning_match = re.search(r"REASONING:\s*(.*?)(?=DOMAIN:|PROBLEM:|$)", text, re.DOTALL | re.IGNORECASE)
-                reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
-                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning=reasoning)
-
-            # Try finding define blocks
-            domain_paren = re.search(r"\(define\s*\(domain.*?\)\)", text, re.DOTALL | re.IGNORECASE)
-            problem_paren = re.search(r"\(define\s*\(problem.*?\)\)", text, re.DOTALL | re.IGNORECASE)
-            if domain_paren and problem_paren:
-                domain = domain_paren.group(0).strip()
-                problem = problem_paren.group(0).strip()
-                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning="")
-                
+            result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=60)
+            self.get_logger().info(f"Transform stdout:\n{result.stdout}")
+            if result.returncode != 0:
+                self.get_logger().error(f"Transform failed with return code {result.returncode}: {result.stderr}")
+                return False
+            return True
+        except subprocess.TimeoutExpired:
+            self.get_logger().error("Transform timed out")
+            return False
         except Exception as e:
-            self.get_logger().error(f"Error extracting PDDL from text: {e}")
-        return None
+            self.get_logger().error(f"Error calling transform.py: {e}")
+            return False
 
     def _run_fast_downward(self, domain_file: str, problem_file: str, timeout: int = 300) -> PlanningResult:
         """Call Fast Downward to produce a plan."""
@@ -725,6 +609,77 @@ Current Robot State:
             if ln:
                 lines.append(ln)
         return lines
+
+    def _parse_planning_json(self, text: str) -> Optional[Dict[str, Any]]:
+        """Parse LLM output into planning data dict following data.json structure."""
+        if not text:
+            return None
+
+        def _try_load(candidate: str) -> Optional[Dict[str, Any]]:
+            try:
+                return json.loads(candidate)
+            except Exception:
+                return None
+
+        text_stripped = text.strip()
+        json_candidates = []
+
+        # Prefer fenced json blocks if present
+        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text_stripped, re.DOTALL)
+        if fenced:
+            json_candidates.append(fenced.group(1))
+
+        # Raw text as-is
+        json_candidates.append(text_stripped)
+
+        # Largest brace-wrapped span fallback
+        brace_start = text_stripped.find("{")
+        brace_end = text_stripped.rfind("}")
+        if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
+            json_candidates.append(text_stripped[brace_start:brace_end + 1])
+
+        parsed: Optional[Dict[str, Any]] = None
+        for candidate in json_candidates:
+            parsed = _try_load(candidate)
+            if isinstance(parsed, dict):
+                break
+
+        if not isinstance(parsed, dict):
+            self.get_logger().error("Failed to parse LLM JSON output")
+            return None
+
+        base_data = parsed.get("data", parsed)
+        if not isinstance(base_data, dict):
+            self.get_logger().error("Parsed JSON missing 'data' object")
+            return None
+
+        objects = base_data.get("objects", [])
+        goals = base_data.get("goals", [])
+
+        if not isinstance(objects, list) or not isinstance(goals, list):
+            self.get_logger().error("JSON does not contain list fields for objects/goals")
+            return None
+
+        sanitized_objects = [str(obj).strip() for obj in objects if str(obj).strip()]
+
+        sanitized_goals: List[Dict[str, Any]] = []
+        for goal in goals:
+            if not isinstance(goal, dict):
+                continue
+            predicate = goal.get("predicate")
+            args = goal.get("args", [])
+            if predicate is None or not isinstance(args, list):
+                continue
+            sanitized_goals.append({
+                "predicate": str(predicate).strip(),
+                "args": [str(arg).strip() for arg in args]
+            })
+
+        if not sanitized_objects and not sanitized_goals:
+            self.get_logger().error("Parsed JSON missing both objects and goals")
+            return None
+
+        return {"objects": sanitized_objects, "goals": sanitized_goals}
 
     # -----------------------
     # Tools
@@ -765,55 +720,41 @@ Current Robot State:
         return tools
 
     # -----------------------
-    # Create PDDL agent
+    # Create Planning Agent
     # -----------------------
     def _create_pddl_agent_executor(self, scene_desc: Optional[str] = None) -> AgentExecutor:
-        """Create an agent that generates PDDL domain and problem files."""
+        """Create an agent that generates planning data (objects and goals) in JSON format using structured output."""
         if scene_desc is None:
             with self._init_lock:
                 scene_desc = self.scene_description if self.scene_description else "Scene not yet analyzed"
 
-        system_message = f"""You are a PDDL domain and problem generator for a robot planning system.
-
-        The current robot state will be provided in the user message.
+        system_message = f"""You are a planning assistant for a robot manipulation system.
 
         Current scene description: {scene_desc}
 
-        Below is a TEMPLATE DOMAIN with predefined actions. You should use this as a starting point:
+        Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
+        {{{{
+            "data": {{{{
+                "objects": ["gear", "bolt"],
+                "goals": [{{{{"predicate": "gripper-close", "args": []}}}}]
+            }}}}
+        }}}}
+        Where the objects are the objects present in the workspace and the goals are the desired FINAL state.
+        DO NOT put intermediate goals in the goals list.
 
-        {FIXED_DOMAIN}
+        Requirements:
+        - Always return the JSON structure above (objects list, goals list). Lengths may vary.
+        - Do not wrap the JSON in Markdown fences.
+        - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
+        - You may call tools like vqa if needed, but the final reply must still be the JSON described.
 
-        Your task is to:
-        1. Review the template domain above
-        2. Modify it ONLY if necessary (e.g., if you need additional predicates, types, or action parameters)
-        3. Generate a corresponding PROBLEM file with:
-        - Object definitions (include directions: left, right, up, down, forward, backward as direction objects)
-        - Initial state based on the provided current robot state
-        - Goal state that achieves the user's instruction
-
-        IMPORTANT GUIDELINES:
-        - If the instruction is unclear, RESPONSE with a clarifying questions before proceeding.
-        - When you need to RESPONSE with a clarifying question, prefix the entire response with the token NORMAL and include only the clarifying question. Do not generate PDDL in that case. All other planning responses should NOT start with NORMAL.
-        - You have access to vision tools like 'vqa' to inspect the scene. You can ask visual questions to gather information about the environment.
-        - Use 'vqa' to find objects, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object
-        - If the instruction specify an existing object, no need to use 'vqa'
-        - Remember that PDDL uses the CLOSED-WORLD ASSUMPTION: anything not stated as true in the initial state is false. You DON'T need to explicitly negate predicates
-        - When instructed to "handover" an object, the goal should be to have the robot at the "handover" location WITH the object IN hand
-        - Prefer using the unmodified domain whenever possible
-
-        Follow this format exactly for planning responses:
-        REASONING:
-        [Explain your approach and any domain modifications]
-
-        DOMAIN:
-        ```pddl
-        [domain content - use template or modified version]
-        ```
-
-        PROBLEM:
-        ```pddl
-        [problem content]
-        ```
+        Predicate hints:
+        - gripper-open: args []
+        - gripper-close: args []
+        - robot-at-location: args [location_name]
+        - object-at-location: args [object_name, location_name]
+        - robot-have: args [object_name]
+        - Available locations: home, ready, handover
         """
 
         prompt = ChatPromptTemplate.from_messages([
@@ -822,7 +763,13 @@ Current Robot State:
             ("human", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
-        agent = create_tool_calling_agent(self.llm, self.tools, prompt)
+        
+        agent = create_tool_calling_agent(
+            llm=self.llm,
+            tools=self.tools,
+            prompt=prompt,
+        )
+
         return AgentExecutor(agent=agent, tools=self.tools, verbose=True, max_iterations=12)
 
     # -----------------------
