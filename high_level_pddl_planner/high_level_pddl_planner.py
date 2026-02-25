@@ -739,6 +739,8 @@ class Ros2HighLevelAgentNode(Node):
                 "goals": [{{{{"predicate": "gripper-close", "args": []}}}}]
             }}}}
         }}}}
+        Where the objects are the objects present in the workspace and the goals are the desired FINAL state.
+        DO NOT put intermediate goals in the goals list.
 
         Requirements:
         - Always return the JSON structure above (objects list, goals list). Lengths may vary.
@@ -753,7 +755,6 @@ class Ros2HighLevelAgentNode(Node):
         - object-at-location: args [object_name, location_name]
         - robot-have: args [object_name]
         - Available locations: home, ready, handover
-        - For handover, ensure the gripper is closed at handover with the requested object.
         """
 
         prompt = ChatPromptTemplate.from_messages([
