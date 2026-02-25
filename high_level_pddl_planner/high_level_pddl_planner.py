@@ -36,11 +36,9 @@ from custom_interfaces.srv import (
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool, tool
-from langchain.agents import create_agent, AgentExecutor
-from langchain.agents.structured_output import ToolStrategy
+from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_ollama import ChatOllama
-from pydantic import BaseModel, Field
 
 
 from dotenv import load_dotenv
@@ -49,16 +47,9 @@ ENV_PATH = '/home/group11/final_project_ws/src/high_level_pddl_planner/.env'
 load_dotenv(dotenv_path=ENV_PATH)
 
 FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", "./fastdownward/fast-downward.py")
-SAS_PATH_PLAN = "/home/group11/final_project_ws/src/high_level_pddl_planner/sas_plan"
-TRANSFORM_PY = os.getenv("TRANSFORM_PY", "./transform.py")
+TRANSFORM_PY = os.getenv("TRANSFORM_PY", "transform.py")
 TEMPLATE_PROBLEM = os.getenv("TEMPLATE_PROBLEM", "./template_problem.pddl")
 DOMAIN_PDDL = os.getenv("DOMAIN_PDDL", "./domain.pddl")
-
-class PlanningData(BaseModel):
-    """Structured planning data for robot manipulation tasks."""
-    objects: List[str] = Field(description="List of object names involved in the task")
-    goals: List[Dict[str, Any]] = Field(description="List of goal predicates with format {predicate: str, args: List[str]}")
-
 
 class PDDLGenerationResult:
     def __init__(self, json_data: Dict[str, Any]):
@@ -177,8 +168,8 @@ class Ros2HighLevelAgentNode(Node):
         """
         try:
             self.get_logger().info("Waiting for /vqa action server...")
-            if not self.vision_vqa_client.wait_for_server(timeout_sec=30.0):
-                self.get_logger().error("/vqa action server unavailable after 30 seconds. Node will not initialize.")
+            if not self.vision_vqa_client.wait_for_server(timeout_sec=120.0):
+                self.get_logger().error("/vqa action server unavailable after 120 seconds. Node will not initialize.")
                 with self._init_lock:
                     self.scene_description = "Scene not available"
                     scene_desc = self.scene_description
@@ -308,7 +299,7 @@ class Ros2HighLevelAgentNode(Node):
         state['robot_at_ready'] = is_ready if is_ready is not None else False
         state['robot_in_handover'] = is_handover if is_handover is not None else False
         state['gripper_open'] = gripper_open if gripper_open is not None else True
-        state['gripper_closed'] = not state['gripper_open']
+        state['gripper_close'] = not state['gripper_open']
         
         self.get_logger().info(f"Current state: {state}")
         return state
@@ -328,8 +319,8 @@ class Ros2HighLevelAgentNode(Node):
         # Add gripper predicates
         if current_state.get('gripper_open'):
             init_predicates.append({"predicate": "gripper-open", "args": []})
-        if current_state.get('gripper_closed'):
-            init_predicates.append({"predicate": "gripper-closed", "args": []})
+        if current_state.get('gripper_close'):
+            init_predicates.append({"predicate": "gripper-close", "args": []})
         
         return init_predicates
 
@@ -407,26 +398,18 @@ class Ros2HighLevelAgentNode(Node):
 
             self.response_pub.publish(String(data="Generating planning data and PDDL problem file"))
 
-            # The agent output should contain structured_response from the agent executor
-            if not isinstance(agent_resp, dict) or "structured_response" not in agent_resp:
+            planning_payload = self._parse_planning_json(final_text)
+            if not planning_payload:
                 msg = "Hmm... I couldn't generate valid planning data. Could you try rephrasing that?"
-                self.get_logger().error("Failed to get structured response from agent.")
+                self.get_logger().error("LLM response could not be parsed into planning JSON.")
                 self.response_pub.publish(String(data=msg))
                 return []
 
-            structured_data = agent_resp["structured_response"]
-            
-            # structured_data is a PlanningData Pydantic model instance
-            if isinstance(structured_data, PlanningData):
-                json_gen_data = {
-                    "objects": structured_data.objects,
-                    "goals": structured_data.goals,
-                    "init": init_predicates
-                }
-            else:
-                # Fallback if it's already a dict
-                json_gen_data = structured_data if isinstance(structured_data, dict) else structured_data.model_dump()
-                json_gen_data["init"] = init_predicates
+            json_gen_data = {
+                "objects": planning_payload.get("objects", []),
+                "goals": planning_payload.get("goals", []),
+                "init": init_predicates,
+            }
 
             # Store JSON for reference
             json_result = PDDLGenerationResult(json_data=json_gen_data)
@@ -575,7 +558,8 @@ class Ros2HighLevelAgentNode(Node):
     def _run_transform(self, template_file: str, data_json_file: str, output_file: str) -> bool:
         """Call transform.py to generate problem PDDL from template and JSON data."""
         workdir = str(Path(template_file).parent)
-        cmd = ["uv", "run", TRANSFORM_PY, template_file, data_json_file, output_file]
+
+        cmd = ["python3", TRANSFORM_PY, template_file, data_json_file, output_file]
         self.get_logger().info(f"Calling transform.py: {' '.join(cmd)} (workdir={workdir})")
         try:
             result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=60)
@@ -626,6 +610,77 @@ class Ros2HighLevelAgentNode(Node):
                 lines.append(ln)
         return lines
 
+    def _parse_planning_json(self, text: str) -> Optional[Dict[str, Any]]:
+        """Parse LLM output into planning data dict following data.json structure."""
+        if not text:
+            return None
+
+        def _try_load(candidate: str) -> Optional[Dict[str, Any]]:
+            try:
+                return json.loads(candidate)
+            except Exception:
+                return None
+
+        text_stripped = text.strip()
+        json_candidates = []
+
+        # Prefer fenced json blocks if present
+        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text_stripped, re.DOTALL)
+        if fenced:
+            json_candidates.append(fenced.group(1))
+
+        # Raw text as-is
+        json_candidates.append(text_stripped)
+
+        # Largest brace-wrapped span fallback
+        brace_start = text_stripped.find("{")
+        brace_end = text_stripped.rfind("}")
+        if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
+            json_candidates.append(text_stripped[brace_start:brace_end + 1])
+
+        parsed: Optional[Dict[str, Any]] = None
+        for candidate in json_candidates:
+            parsed = _try_load(candidate)
+            if isinstance(parsed, dict):
+                break
+
+        if not isinstance(parsed, dict):
+            self.get_logger().error("Failed to parse LLM JSON output")
+            return None
+
+        base_data = parsed.get("data", parsed)
+        if not isinstance(base_data, dict):
+            self.get_logger().error("Parsed JSON missing 'data' object")
+            return None
+
+        objects = base_data.get("objects", [])
+        goals = base_data.get("goals", [])
+
+        if not isinstance(objects, list) or not isinstance(goals, list):
+            self.get_logger().error("JSON does not contain list fields for objects/goals")
+            return None
+
+        sanitized_objects = [str(obj).strip() for obj in objects if str(obj).strip()]
+
+        sanitized_goals: List[Dict[str, Any]] = []
+        for goal in goals:
+            if not isinstance(goal, dict):
+                continue
+            predicate = goal.get("predicate")
+            args = goal.get("args", [])
+            if predicate is None or not isinstance(args, list):
+                continue
+            sanitized_goals.append({
+                "predicate": str(predicate).strip(),
+                "args": [str(arg).strip() for arg in args]
+            })
+
+        if not sanitized_objects and not sanitized_goals:
+            self.get_logger().error("Parsed JSON missing both objects and goals")
+            return None
+
+        return {"objects": sanitized_objects, "goals": sanitized_goals}
+
     # -----------------------
     # Tools
     # -----------------------
@@ -675,38 +730,30 @@ class Ros2HighLevelAgentNode(Node):
 
         system_message = f"""You are a planning assistant for a robot manipulation system.
 
-        The current robot state will be provided in the user message.
-
         Current scene description: {scene_desc}
 
-        Your task is to analyze the user's instruction and generate planning data that defines:
-        1. Objects involved in the task (list the specific object names)
-        2. Goal predicates that should be achieved (list the desired states)
+        Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
+        {{{{
+            "data": {{{{
+                "objects": ["gear", "bolt"],
+                "goals": [{{{{"predicate": "gripper-close", "args": []}}}}]
+            }}}}
+        }}}}
 
-        The planning data format:
-        - objects: List of object names (e.g., ["gear", "bolt"])
-        - goals: List of goal predicates, each with predicate name and arguments
-          Examples:
-          - {{"predicate": "gripper-closed", "args": []}}
-          - {{"predicate": "robot-at-location", "args": ["handover"]}}
-          - {{"predicate": "object-at-location", "args": ["gear", "handover"]}}
-          - {{"predicate": "robot-have", "args": ["gear"]}}
+        Requirements:
+        - Always return the JSON structure above (objects list, goals list). Lengths may vary.
+        - Do not wrap the JSON in Markdown fences.
+        - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
+        - You may call tools like vqa if needed, but the final reply must still be the JSON described.
 
-        Common predicates:
-        - gripper-open: Empty args list
-        - gripper-closed: Empty args list
-        - robot-at-location: args = [location_name]
-        - object-at-location: args = [object_name, location_name]
-        - robot-have: args = [object_name]
-
-        Available locations: home, ready, handover
-
-        IMPORTANT GUIDELINES:
-        - If the instruction is unclear, respond with a clarifying question only. Prefix with NORMAL and ask the question.
-        - Use vision tools (vqa) to inspect the scene and identify objects if needed.
-        - When asked to "handover" an object, goals should include gripper-closed at handover location.
-        - List all relevant objects in the objects array.
-        - Include all necessary goal predicates for the desired end state.
+        Predicate hints:
+        - gripper-open: args []
+        - gripper-close: args []
+        - robot-at-location: args [location_name]
+        - object-at-location: args [object_name, location_name]
+        - robot-have: args [object_name]
+        - Available locations: home, ready, handover
+        - For handover, ensure the gripper is closed at handover with the requested object.
         """
 
         prompt = ChatPromptTemplate.from_messages([
@@ -716,14 +763,12 @@ class Ros2HighLevelAgentNode(Node):
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
         
-        # Create agent with structured output
-        agent = create_agent(
-            self.llm,
-            self.tools,
-            prompt,
-            response_format=ToolStrategy(PlanningData, handle_errors=True)
+        agent = create_tool_calling_agent(
+            llm=self.llm,
+            tools=self.tools,
+            prompt=prompt,
         )
-        
+
         return AgentExecutor(agent=agent, tools=self.tools, verbose=True, max_iterations=12)
 
     # -----------------------

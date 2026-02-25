@@ -49,10 +49,10 @@
   
   (:action open_gripper
     :parameters ()
-    :precondition (gripper-closed)
+    :precondition (gripper-close)
     :effect (and
       (gripper-open)
-      (not (gripper-closed))
+      (not (gripper-close))
     )
   )
   
@@ -60,7 +60,7 @@
     :parameters ()
     :precondition (gripper-open)
     :effect (and
-      (gripper-closed)
+      (gripper-close)
       (not (gripper-open))
     )
   )
