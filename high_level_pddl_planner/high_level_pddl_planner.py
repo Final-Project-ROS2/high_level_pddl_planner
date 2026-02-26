@@ -133,6 +133,7 @@ class Ros2HighLevelAgentNode(Node):
         self.latest_plan: Optional[List[str]] = None
         self.latest_pddl: Optional[PDDLGenerationResult] = None
         self.last_goal_state: Optional[List[Dict[str, Any]]] = None  # Store goal state from previous successful execution
+        self.initial_state_summary: Optional[str] = None
 
         self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
         self.reset_state_srv = self.create_service(Trigger, "/reset_state", self.reset_state_callback)
@@ -380,6 +381,8 @@ class Ros2HighLevelAgentNode(Node):
                         init_predicates.append(goal)
                 self.get_logger().info(f"Combined init predicates: {init_predicates}")
 
+            self.initial_state_summary = self._format_predicates(init_predicates)
+
             # Build LangChain chat history
             langchain_history = []
             for msg in self.chat_history[:-1]:
@@ -491,8 +494,11 @@ class Ros2HighLevelAgentNode(Node):
                     self.get_logger().info("Executing confirmed plan...")
 
                     for i, step in enumerate(self.latest_plan, start=1):
+                        actions_completed = self.latest_plan[: i - 1]
+                        step_payload = self._compose_step_instruction(step, actions_completed)
+
                         self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
-                        result = self.send_step_to_medium_async(step)
+                        result = self.send_step_to_medium_async(step_payload)
 
                         if result is None or not result.success:
                             msg = f"Step {i} failed: {step}. Stopping execution."
@@ -520,6 +526,7 @@ class Ros2HighLevelAgentNode(Node):
                     self.chat_history.clear()
                     self.latest_plan = None
                     self.latest_pddl = None
+                    self.initial_state_summary = None
 
                 execution_thread = threading.Thread(target=execute_plan, daemon=True)
                 execution_thread.start()
@@ -551,8 +558,11 @@ class Ros2HighLevelAgentNode(Node):
             self.get_logger().info("Executing confirmed plan...")
 
             for i, step in enumerate(self.latest_plan, start=1):
+                actions_completed = self.latest_plan[: i - 1]
+                step_payload = self._compose_step_instruction(step, actions_completed)
+
                 self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
-                result = self.send_step_to_medium_async(step)
+                result = self.send_step_to_medium_async(step_payload)
 
                 if result is None or not result.success:
                     msg = f"Step {i} failed: {step}. Stopping execution."
@@ -577,6 +587,7 @@ class Ros2HighLevelAgentNode(Node):
             self.chat_history.clear()
             self.latest_plan = None
             self.latest_pddl = None
+            self.initial_state_summary = None
 
         execution_thread = threading.Thread(target=execute_plan, daemon=True)
         execution_thread.start()
@@ -591,6 +602,7 @@ class Ros2HighLevelAgentNode(Node):
         self.chat_history.clear()
         self.latest_plan = None
         self.latest_pddl = None
+        self.initial_state_summary = None
         
         response.success = True
         response.message = "State has been reset. Ready for new instructions."
@@ -729,6 +741,24 @@ class Ros2HighLevelAgentNode(Node):
             return None
 
         return {"locations": sanitized_locations, "objects": sanitized_objects, "goals": sanitized_goals}
+
+    def _format_predicates(self, predicates: List[Dict[str, Any]]) -> str:
+        """Create a compact string description of predicate list."""
+        parts = []
+        for pred in predicates:
+            name = str(pred.get("predicate", "")).strip()
+            args = pred.get("args", []) or []
+            if not name:
+                continue
+            arg_str = " ".join(str(a).strip() for a in args if str(a).strip())
+            parts.append(f"{name} {arg_str}".strip())
+        return "; ".join(parts) if parts else "unknown"
+
+    def _compose_step_instruction(self, step_text: str, actions_completed: List[str]) -> str:
+        """Attach initial state and prior steps to the current instruction."""
+        initial = self.initial_state_summary or "unknown"
+        completed = "; ".join(actions_completed) if actions_completed else "none"
+        return f"Initial state: {initial}\nactions completed: {completed}\nInstruction: {step_text}"
 
     # -----------------------
     # Tools
