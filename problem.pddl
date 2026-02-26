@@ -2,7 +2,7 @@
   (:domain robot-manipulation)
 
   (:objects
-    home ready handover - location
+    home ready handover left-of-gear - location
     left right up down forward backward - direction
     gear - object
     bolt - object
@@ -15,4 +15,4 @@
     (gripper-closed )
   ))
 )
-; This PDDL problem file was generated on 2026-02-25 08:27:30.905881
+; This PDDL problem file was generated on 2026-02-25 11:16:23.319604
