@@ -755,10 +755,11 @@ class Ros2HighLevelAgentNode(Node):
         return "; ".join(parts) if parts else "unknown"
 
     def _compose_step_instruction(self, step_text: str, actions_completed: List[str]) -> str:
-        """Attach initial state and prior steps to the current instruction."""
+        """Attach workspace context, initial state, and prior steps to the current instruction."""
+        workspace = self.scene_description or "unknown"
         initial = self.initial_state_summary or "unknown"
         completed = "; ".join(actions_completed) if actions_completed else "none"
-        return f"Initial state: {initial}\nactions completed: {completed}\nInstruction: {step_text}"
+        return f"Workspace context: {workspace}\nInitial state: {initial}\nactions completed: {completed}\nInstruction: {step_text}"
 
     # -----------------------
     # Tools
