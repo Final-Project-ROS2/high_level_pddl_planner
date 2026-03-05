@@ -821,17 +821,17 @@ class Ros2HighLevelAgentNode(Node):
             }}}}
         }}}}
         Where
-        - locations are task-specific locations needed to complete the instruction
+        - locations are task-specific locations needed to complete the instruction.
         - objects are the objects present in the workspace
         - goals are the desired FINAL state.
         DO NOT put intermediate goals in the goals list.
         - If the user ask to "handover" or "hand me" an object, the requested object should be located at handover
 
         Requirements:
-        - DO NOT include home, ready, handover in locations as these are already provided
         - Always return the JSON structure above (objects list, goals list). Lengths may vary.
         - Object names CANNOT contain spaces, use underscore
         - Do not wrap the JSON in Markdown fences.
+        - You can add modifiers to the object name, like screwdriver_leftmost, so you DO NOT need to ask clarifying questions
         - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
         - You may call tools like vqa if needed, but the final reply must still be the JSON described.
 
@@ -840,6 +840,7 @@ class Ros2HighLevelAgentNode(Node):
         - gripper-open: args []
         - gripper-close: args []
         - robot-at-location: args [location_name]
+        - robot-at-object: args [object_name]
         - object-at-location: args [object_name, location_name]
         - robot-have: args [object_name]
         - Available locations: home, ready, handover
