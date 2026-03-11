@@ -72,6 +72,15 @@ def main(args):
     # Extract the 'data' key if it exists, otherwise use the whole JSON
     data = json_content.get('data', json_content)
 
+    # Filter reserved locations from the locations list
+    reserved_locations = {'ready', 'home', 'handover'}
+    objects_set = set(data['objects']) if 'objects' in data and isinstance(data.get('objects'), list) else set()
+    if 'locations' in data and isinstance(data['locations'], list):
+        data['locations'] = [
+            loc for loc in data['locations']
+            if loc not in reserved_locations and loc not in objects_set
+        ]
+
     # Render template with data
     try:
         transformed = transform(template_string, data)
