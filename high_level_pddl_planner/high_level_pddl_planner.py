@@ -23,7 +23,7 @@ from std_srvs.srv import SetBool, Trigger
 from std_msgs.msg import String
 from geometry_msgs.msg import Pose
 
-from custom_interfaces.action import Prompt
+from custom_interfaces.action import Prompt, PromptScene
 from custom_interfaces.srv import (
     DetectObjects,
     ClassifyBBox,
@@ -48,8 +48,13 @@ load_dotenv(dotenv_path=ENV_PATH)
 
 FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", "./fastdownward/fast-downward.py")
 TRANSFORM_PY = os.getenv("TRANSFORM_PY", "transform.py")
+TRANSFORM_BLOCKSWORLD_PY = os.getenv("TRANSFORM_BLOCKSWORLD_PY", "transform_blocksworld.py")
+TRANSFORM_GRIPPER_PY = os.getenv("TRANSFORM_GRIPPER_PY", "transform_gripper.py")
 TEMPLATE_PROBLEM = os.getenv("TEMPLATE_PROBLEM", "./template_problem.pddl")
 DOMAIN_PDDL = os.getenv("DOMAIN_PDDL", "./domain.pddl")
+
+SCENE_DESC_MODES = {"default", "custom", "disabled"}
+DOMAIN_MODES = {"default", "blocksworld", "gripper"}
 
 class PDDLGenerationResult:
     def __init__(self, json_data: Dict[str, Any]):
@@ -82,6 +87,18 @@ class Ros2HighLevelAgentNode(Node):
         self.use_ollama: bool = self.get_parameter("use_ollama").get_parameter_value().bool_value
         self.declare_parameter("confirm", True)
         self.confirm: bool = self.get_parameter("confirm").get_parameter_value().bool_value
+
+        self.declare_parameter("scene_desc", "default")
+        raw_scene_desc_mode = self.get_parameter("scene_desc").get_parameter_value().string_value
+        self.scene_desc_mode = self._validate_enum_parameter("scene_desc", raw_scene_desc_mode, SCENE_DESC_MODES)
+
+        self.declare_parameter("domain", "default")
+        raw_domain_mode = self.get_parameter("domain").get_parameter_value().string_value
+        self.domain_mode = self._validate_enum_parameter("domain", raw_domain_mode, DOMAIN_MODES)
+
+        self.get_logger().info(
+            f"Planner configuration: scene_desc={self.scene_desc_mode}, domain={self.domain_mode}"
+        )
 
         self.declare_parameter("ollama_model", "gpt-oss:20b")
         self.ollama_model: str = self.get_parameter("ollama_model").get_parameter_value().string_value
@@ -138,9 +155,11 @@ class Ros2HighLevelAgentNode(Node):
         self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
         self.reset_state_srv = self.create_service(Trigger, "/reset_state", self.reset_state_callback)
 
+        self.high_level_action_type = PromptScene if self.scene_desc_mode == "custom" else Prompt
+
         self._action_server = ActionServer(
             self,
-            Prompt,
+            self.high_level_action_type,
             "prompt_high_level",
             execute_callback=self.execute_callback,
             goal_callback=self.goal_callback,
@@ -150,12 +169,36 @@ class Ros2HighLevelAgentNode(Node):
         self.response_pub = self.create_publisher(String, "/response", 10)
         self.benchmark_pub = self.create_publisher(String, "/benchmark_logs", 10)
 
-        self.get_logger().info("Ros2 High-Level Agent Node initialized. Fetching scene description...")
+        if self.scene_desc_mode == "default":
+            self.get_logger().info("Ros2 High-Level Agent Node initialized. Fetching scene description...")
+            init_thread = threading.Thread(target=self._initialize_scene_description, daemon=False)
+            init_thread.start()
+            self.get_logger().info("Ros2 High-Level Agent Node ready (waiting for scene description before accepting requests).")
+        else:
+            if self.scene_desc_mode == "custom":
+                self.scene_description = "Scene description provided via /prompt_high_level requests"
+            else:
+                self.scene_description = None
 
-        init_thread = threading.Thread(target=self._initialize_scene_description, daemon=False)
-        init_thread.start()
+            self.agent_executor = self._create_pddl_agent_executor(
+                scene_desc=self.scene_description if self.scene_desc_mode != "disabled" else None
+            )
+            with self._init_lock:
+                self.initialized = True
+            self.get_logger().info(
+                "Ros2 High-Level Agent Node ready (scene initialization via /vqa is disabled by configuration)."
+            )
 
-        self.get_logger().info("Ros2 High-Level Agent Node ready (waiting for scene description before accepting requests).")
+    def _validate_enum_parameter(self, name: str, value: str, valid_values: set) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized in valid_values:
+            return normalized
+        fallback = "default" if "default" in valid_values else sorted(valid_values)[0]
+        self.get_logger().warn(
+            f"Invalid value '{value}' for parameter '{name}'. Falling back to '{fallback}'. "
+            f"Valid values: {sorted(valid_values)}"
+        )
+        return fallback
 
     def _benchmark_log(self, label: str):
         t = self.get_clock().now()
@@ -335,6 +378,15 @@ class Ros2HighLevelAgentNode(Node):
         if not text:
             return
 
+        if self.scene_desc_mode == "custom":
+            warn_msg = (
+                "scene_desc=custom requires /prompt_high_level action requests with scene_desc. "
+                "Transcript input is ignored in this mode."
+            )
+            self.get_logger().warn(warn_msg)
+            self.response_pub.publish(String(data=warn_msg))
+            return
+
         if not self.initialized:
             self.get_logger().warn("Node not fullly initialized yet. Ignoring transcript.")
             self.response_pub.publish(String(data="Still initializing, please wait a moment..."))
@@ -352,7 +404,12 @@ class Ros2HighLevelAgentNode(Node):
         )
         plan_thread.start()
 
-    def _generate_plan(self, instruction_text: str, start_time: Optional[float] = None) -> List[str]:
+    def _generate_plan(
+        self,
+        instruction_text: str,
+        start_time: Optional[float] = None,
+        request_scene_desc: Optional[str] = None,
+    ) -> List[str]:
         """Generate a plan using fixed domain and dynamic problem generation."""
         self.chat_history.append({"role": "user", "content": instruction_text})
 
@@ -363,6 +420,28 @@ class Ros2HighLevelAgentNode(Node):
             self.get_logger().info("High-level agent (PDDL): generating plan with fixed domain...")
             self.response_pub.publish(String(data="Got it! Let me think through that..."))
             self.response_pub.publish(String(data="Analyzing scene and determining current state"))
+
+            if self.scene_desc_mode == "custom":
+                scene_from_request = (request_scene_desc or "").strip()
+                if not scene_from_request:
+                    self.get_logger().warn(
+                        "scene_desc=custom but request scene_desc is empty. Falling back to placeholder."
+                    )
+                    scene_from_request = "Scene description unavailable"
+                with self._init_lock:
+                    self.scene_description = scene_from_request
+                self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_from_request)
+            elif self.scene_desc_mode == "disabled":
+                self.scene_description = None
+                if self.agent_executor is None:
+                    self.agent_executor = self._create_pddl_agent_executor(scene_desc=None)
+            elif self.agent_executor is None:
+                with self._init_lock:
+                    current_scene = self.scene_description
+                self.agent_executor = self._create_pddl_agent_executor(scene_desc=current_scene)
+
+            if self.agent_executor is None:
+                raise RuntimeError("Agent executor is not initialized")
 
             # Get current state from services
             current_state = self._get_current_state()
@@ -614,11 +693,18 @@ class Ros2HighLevelAgentNode(Node):
     # JSON and Transform helpers
     # -----------------------
     def _run_transform(self, template_file: str, data_json_file: str, output_file: str) -> bool:
-        """Call transform.py to generate problem PDDL from template and JSON data."""
+        """Call the appropriate transform script to generate problem PDDL from template and JSON data."""
         workdir = str(Path(template_file).parent)
 
-        cmd = ["python3", TRANSFORM_PY, template_file, data_json_file, output_file]
-        self.get_logger().info(f"Calling transform.py: {' '.join(cmd)} (workdir={workdir})")
+        if self.domain_mode == "blocksworld":
+            transform_script = TRANSFORM_BLOCKSWORLD_PY
+        elif self.domain_mode == "gripper":
+            transform_script = TRANSFORM_GRIPPER_PY
+        else:
+            transform_script = TRANSFORM_PY
+
+        cmd = ["python3", transform_script, template_file, data_json_file, output_file]
+        self.get_logger().info(f"Calling transform script ({self.domain_mode}): {' '.join(cmd)} (workdir={workdir})")
         try:
             result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=60)
             self.get_logger().info(f"Transform stdout:\n{result.stdout}")
@@ -756,7 +842,10 @@ class Ros2HighLevelAgentNode(Node):
 
     def _compose_step_instruction(self, step_text: str, actions_completed: List[str]) -> str:
         """Attach workspace context, initial state, and prior steps to the current instruction."""
-        workspace = self.scene_description or "unknown"
+        if self.scene_desc_mode == "disabled":
+            workspace = "scene description disabled"
+        else:
+            workspace = self.scene_description or "unknown"
         initial = self.initial_state_summary or "unknown"
         completed = "; ".join(actions_completed) if actions_completed else "none"
         return f"Workspace context: {workspace}\nInitial state: {initial}\nactions completed: {completed}\nInstruction: {step_text}"
@@ -802,49 +891,71 @@ class Ros2HighLevelAgentNode(Node):
     # -----------------------
     # Create Planning Agent
     # -----------------------
+    def _build_system_message(self, scene_desc: Optional[str]) -> str:
+        include_scene_desc = self.scene_desc_mode != "disabled"
+
+        if self.domain_mode == "blocksworld":
+            return self._build_blocksworld_system_message(scene_desc, include_scene_desc)
+        if self.domain_mode == "gripper":
+            return self._build_gripper_system_message(scene_desc, include_scene_desc)
+        return self._build_default_system_message(scene_desc, include_scene_desc)
+
+    def _build_default_system_message(self, scene_desc: Optional[str], include_scene_desc: bool) -> str:
+        scene_section = ""
+        if include_scene_desc:
+            effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
+            scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
+
+        return f"""You are a planning assistant for a robot manipulation system.{scene_section}
+Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
+{{
+    "data": {{
+        "locations": ["left-of-gear"],
+        "objects": ["gear", "bolt"],
+        "goals": [{{"predicate": "gripper-close", "args": []}}]
+    }}
+}}
+Where
+- locations are task-specific locations needed to complete the instruction.
+- objects are the objects present in the workspace
+- goals are the desired FINAL state.
+DO NOT put intermediate goals in the goals list.
+- If the user ask to "handover" or "hand me" an object, the requested object should be located at handover
+
+Requirements:
+- Always return the JSON structure above (objects list, goals list). Lengths may vary.
+- Object names CANNOT contain spaces, use underscore
+- Do not wrap the JSON in Markdown fences.
+- You can add modifiers to the object name, like screwdriver_leftmost, so you DO NOT need to ask clarifying questions
+- If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
+- You may call tools like vqa if needed, but the final reply must still be the JSON described.
+
+Predicate hints:
+- DO NOT create new predicates
+- gripper-open: args []
+- gripper-close: args []
+- robot-at-location: args [location_name]
+- robot-at-object: args [object_name]
+- object-at-location: args [object_name, location_name]
+- robot-have: args [object_name]
+- Available locations: home, ready, handover
+"""
+
+    def _build_blocksworld_system_message(self, scene_desc: Optional[str], include_scene_desc: bool) -> str:
+        # Placeholder template for blocksworld domain (intentionally same as default for now).
+        return self._build_default_system_message(scene_desc, include_scene_desc)
+
+    def _build_gripper_system_message(self, scene_desc: Optional[str], include_scene_desc: bool) -> str:
+        # Placeholder template for gripper domain (intentionally same as default for now).
+        return self._build_default_system_message(scene_desc, include_scene_desc)
+
     def _create_pddl_agent_executor(self, scene_desc: Optional[str] = None) -> AgentExecutor:
         """Create an agent that generates planning data (objects and goals) in JSON format using structured output."""
         if scene_desc is None:
             with self._init_lock:
-                scene_desc = self.scene_description if self.scene_description else "Scene not yet analyzed"
+                scene_desc = self.scene_description
 
-        system_message = f"""You are a planning assistant for a robot manipulation system.
-
-        Current scene description: {scene_desc}
-
-        Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
-        {{{{
-            "data": {{{{
-                "locations": ["left-of-gear"],
-                "objects": ["gear", "bolt"],
-                "goals": [{{{{"predicate": "gripper-close", "args": []}}}}]
-            }}}}
-        }}}}
-        Where
-        - locations are task-specific locations needed to complete the instruction.
-        - objects are the objects present in the workspace
-        - goals are the desired FINAL state.
-        DO NOT put intermediate goals in the goals list.
-        - If the user ask to "handover" or "hand me" an object, the requested object should be located at handover
-
-        Requirements:
-        - Always return the JSON structure above (objects list, goals list). Lengths may vary.
-        - Object names CANNOT contain spaces, use underscore
-        - Do not wrap the JSON in Markdown fences.
-        - You can add modifiers to the object name, like screwdriver_leftmost, so you DO NOT need to ask clarifying questions
-        - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
-        - You may call tools like vqa if needed, but the final reply must still be the JSON described.
-
-        Predicate hints:
-        - DO NOT create new predicates
-        - gripper-open: args []
-        - gripper-close: args []
-        - robot-at-location: args [location_name]
-        - robot-at-object: args [object_name]
-        - object-at-location: args [object_name, location_name]
-        - robot-have: args [object_name]
-        - Available locations: home, ready, handover
-        """
+        system_message = self._build_system_message(scene_desc)
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_message),
@@ -887,7 +998,7 @@ class Ros2HighLevelAgentNode(Node):
         prompt_text = goal_handle.request.prompt
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
 
-        feedback_msg = Prompt.Feedback()
+        feedback_msg = self.high_level_action_type.Feedback()
         result_container: Dict[str, Any] = {"success": False, "final_response": ""}
 
         def run_pipeline():
@@ -900,7 +1011,12 @@ class Ros2HighLevelAgentNode(Node):
 
                 self.get_logger().info(f"High-level Prompt action received: {goal_text}")
 
-                steps = self._generate_plan(goal_text, start_time=self.start_time)
+                request_scene_desc = getattr(goal_handle.request, "scene_desc", None)
+                steps = self._generate_plan(
+                    goal_text,
+                    start_time=self.start_time,
+                    request_scene_desc=request_scene_desc,
+                )
                 if not steps:
                     result_container["success"] = False
                     result_container["final_response"] = "Failed to generate plan"
@@ -935,7 +1051,7 @@ class Ros2HighLevelAgentNode(Node):
         except Exception:
             pass
 
-        result_msg = Prompt.Result()
+        result_msg = self.high_level_action_type.Result()
         result_msg.success = bool(result_container.get("success", False))
         result_msg.final_response = str(result_container.get("final_response", ""))
 
