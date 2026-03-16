@@ -906,48 +906,138 @@ class Ros2HighLevelAgentNode(Node):
             effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
             scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
 
-        return f"""You are a planning assistant for a robot manipulation system.{scene_section}
-Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
-{{
-    "data": {{
-        "locations": ["left-of-gear"],
-        "objects": ["gear", "bolt"],
-        "goals": [{{"predicate": "gripper-close", "args": []}}]
-    }}
-}}
-Where
-- locations are task-specific locations needed to complete the instruction.
-- objects are the objects present in the workspace
-- goals are the desired FINAL state.
-DO NOT put intermediate goals in the goals list.
-- If the user ask to "handover" or "hand me" an object, the requested object should be located at handover
+        system_message = f"""You are a planning assistant for a robot manipulation system.
 
-Requirements:
-- Always return the JSON structure above (objects list, goals list). Lengths may vary.
-- Object names CANNOT contain spaces, use underscore
-- Do not wrap the JSON in Markdown fences.
-- You can add modifiers to the object name, like screwdriver_leftmost, so you DO NOT need to ask clarifying questions
-- If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
-- You may call tools like vqa if needed, but the final reply must still be the JSON described.
+        {scene_section}
 
-Predicate hints:
-- DO NOT create new predicates
-- gripper-open: args []
-- gripper-close: args []
-- robot-at-location: args [location_name]
-- robot-at-object: args [object_name]
-- object-at-location: args [object_name, location_name]
-- robot-have: args [object_name]
-- Available locations: home, ready, handover
-"""
+        Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
+        {{{{
+            "data": {{{{
+                "locations": ["left-of-gear"],
+                "objects": ["gear", "bolt"],
+                "goals": [{{{{"predicate": "gripper-close", "args": []}}}}]
+            }}}}
+        }}}}
+        Where
+        - locations are task-specific locations needed to complete the instruction.
+        - objects are the objects present in the workspace
+        - goals are the desired FINAL state.
+        DO NOT put intermediate goals in the goals list.
+        - If the user ask to "handover" or "hand me" an object, the requested object should be located at handover
+
+        Requirements:
+        - Always return the JSON structure above (objects list, goals list). Lengths may vary.
+        - Object names CANNOT contain spaces, use underscore
+        - Do not wrap the JSON in Markdown fences.
+        - You can add modifiers to the object name, like screwdriver_leftmost, so you DO NOT need to ask clarifying questions
+        - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
+        - You may call tools like vqa if needed, but the final reply must still be the JSON described.
+
+        Predicate hints:
+        - DO NOT create new predicates
+        - gripper-open: args []
+        - gripper-close: args []
+        - robot-at-location: args [location_name]
+        - robot-at-object: args [object_name]
+        - object-at-location: args [object_name, location_name]
+        - robot-have: args [object_name]
+        - Available locations: home, ready, handover
+        """
+
+        return system_message
+
 
     def _build_blocksworld_system_message(self, scene_desc: Optional[str], include_scene_desc: bool) -> str:
-        # Placeholder template for blocksworld domain (intentionally same as default for now).
-        return self._build_default_system_message(scene_desc, include_scene_desc)
+        scene_section = ""
+        if include_scene_desc:
+            effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
+            scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
+
+        system_message = f"""You are a planning assistant for a robot manipulation system.
+
+        {scene_section}
+
+        Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
+        {{{{
+            "data": {{{{
+                "locations": ["left-of-gear"],
+                "objects": ["gear", "bolt"],
+                "goals": [{{{{"predicate": "gripper-close", "args": []}}}}]
+            }}}}
+        }}}}
+        Where
+        - locations are task-specific locations needed to complete the instruction.
+        - objects are the objects present in the workspace
+        - goals are the desired FINAL state.
+        DO NOT put intermediate goals in the goals list.
+        - If the user ask to "handover" or "hand me" an object, the requested object should be located at handover
+
+        Requirements:
+        - Always return the JSON structure above (objects list, goals list). Lengths may vary.
+        - Object names CANNOT contain spaces, use underscore
+        - Do not wrap the JSON in Markdown fences.
+        - You can add modifiers to the object name, like screwdriver_leftmost, so you DO NOT need to ask clarifying questions
+        - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
+        - You may call tools like vqa if needed, but the final reply must still be the JSON described.
+
+        Predicate hints:
+        - DO NOT create new predicates
+        - gripper-open: args []
+        - gripper-close: args []
+        - robot-at-location: args [location_name]
+        - robot-at-object: args [object_name]
+        - object-at-location: args [object_name, location_name]
+        - robot-have: args [object_name]
+        - Available locations: home, ready, handover
+        """
+
+        return system_message
 
     def _build_gripper_system_message(self, scene_desc: Optional[str], include_scene_desc: bool) -> str:
-        # Placeholder template for gripper domain (intentionally same as default for now).
-        return self._build_default_system_message(scene_desc, include_scene_desc)
+        scene_section = ""
+        if include_scene_desc:
+            effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
+            scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
+
+        system_message = f"""You are a planning assistant for a robot manipulation system.
+
+        {scene_section}
+
+        Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
+        {{{{
+            "data": {{{{
+                "locations": ["left-of-gear"],
+                "objects": ["gear", "bolt"],
+                "goals": [{{{{"predicate": "gripper-close", "args": []}}}}]
+            }}}}
+        }}}}
+        Where
+        - locations are task-specific locations needed to complete the instruction.
+        - objects are the objects present in the workspace
+        - goals are the desired FINAL state.
+        DO NOT put intermediate goals in the goals list.
+        - If the user ask to "handover" or "hand me" an object, the requested object should be located at handover
+
+        Requirements:
+        - Always return the JSON structure above (objects list, goals list). Lengths may vary.
+        - Object names CANNOT contain spaces, use underscore
+        - Do not wrap the JSON in Markdown fences.
+        - You can add modifiers to the object name, like screwdriver_leftmost, so you DO NOT need to ask clarifying questions
+        - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
+        - You may call tools like vqa if needed, but the final reply must still be the JSON described.
+
+        Predicate hints:
+        - DO NOT create new predicates
+        - gripper-open: args []
+        - gripper-close: args []
+        - robot-at-location: args [location_name]
+        - robot-at-object: args [object_name]
+        - object-at-location: args [object_name, location_name]
+        - robot-have: args [object_name]
+        - Available locations: home, ready, handover
+        """
+
+        return system_message
 
     def _create_pddl_agent_executor(self, scene_desc: Optional[str] = None) -> AgentExecutor:
         """Create an agent that generates planning data (objects and goals) in JSON format using structured output."""
