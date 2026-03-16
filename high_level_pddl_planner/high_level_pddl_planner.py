@@ -43,7 +43,7 @@ from langchain_ollama import ChatOllama
 
 from dotenv import load_dotenv
 
-PROJECT_ROOT = "/home/group11/final_project_ws/src/high_level_pddl_planner"
+PROJECT_ROOT = Path("/home/group11/final_project_ws/src/high_level_pddl_planner")
 
 ENV_PATH = Path(os.getenv("ENV_PATH", str(PROJECT_ROOT / ".env")))
 load_dotenv(dotenv_path=ENV_PATH)
