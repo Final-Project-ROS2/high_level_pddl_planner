@@ -457,24 +457,28 @@ class Ros2HighLevelAgentNode(Node):
             if self.agent_executor is None:
                 raise RuntimeError("Agent executor is not initialized")
 
-            # Get current state from services
-            current_state = self._get_current_state()
-            
-            # Convert current state to init predicates for PDDL template
-            init_predicates = self._state_to_init_predicates(current_state)
-            
-            # Merge with last goal state if available (continuous state tracking)
-            if self.last_goal_state:
-                self.get_logger().info(f"Merging previous goal state into init: {self.last_goal_state}")
-                # Add previous goals to init, avoiding duplicates
-                existing_predicates = {(p["predicate"], tuple(p.get("args", []))): p for p in init_predicates}
-                for goal in self.last_goal_state:
-                    key = (goal["predicate"], tuple(goal.get("args", [])))
-                    if key not in existing_predicates:
-                        init_predicates.append(goal)
-                self.get_logger().info(f"Combined init predicates: {init_predicates}")
+            init_predicates: List[Dict[str, Any]] = []
+            if self.domain_mode == "default":
+                # Get current state from services
+                current_state = self._get_current_state()
 
-            self.initial_state_summary = self._format_predicates(init_predicates)
+                # Convert current state to init predicates for PDDL template
+                init_predicates = self._state_to_init_predicates(current_state)
+
+                # Merge with last goal state if available (continuous state tracking)
+                if self.last_goal_state:
+                    self.get_logger().info(f"Merging previous goal state into init: {self.last_goal_state}")
+                    # Add previous goals to init, avoiding duplicates
+                    existing_predicates = {(p["predicate"], tuple(p.get("args", []))): p for p in init_predicates}
+                    for goal in self.last_goal_state:
+                        key = (goal["predicate"], tuple(goal.get("args", [])))
+                        if key not in existing_predicates:
+                            init_predicates.append(goal)
+                    self.get_logger().info(f"Combined init predicates: {init_predicates}")
+            else:
+                self.get_logger().info(
+                    f"domain={self.domain_mode}: skipping state service init predicates; expecting init from LLM output."
+                )
 
             # Build LangChain chat history
             langchain_history = []
@@ -513,6 +517,11 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().error("LLM response could not be parsed into planning JSON.")
                 self.response_pub.publish(String(data=msg))
                 return []
+
+            if self.domain_mode != "default":
+                init_predicates = planning_payload.get("init", [])
+
+            self.initial_state_summary = self._format_predicates(init_predicates)
 
             json_gen_data = {
                 "locations": planning_payload.get("locations", []),
@@ -819,10 +828,15 @@ class Ros2HighLevelAgentNode(Node):
         locations = base_data.get("locations", [])
         objects = base_data.get("objects", [])
         goals = base_data.get("goals", [])
+        init = base_data.get("init", [])
 
     
         if not isinstance(objects, list) or not isinstance(goals, list) or not isinstance(locations, list):
             self.get_logger().error("JSON does not contain list fields for objects/goals/locations")
+            return None
+
+        if init is not None and not isinstance(init, list):
+            self.get_logger().error("JSON field 'init' must be a list when provided")
             return None
 
         sanitized_locations = [str(loc).strip() for loc in locations if str(loc).strip()]
@@ -841,11 +855,29 @@ class Ros2HighLevelAgentNode(Node):
                 "args": [str(arg).strip() for arg in args]
             })
 
+        sanitized_init: List[Dict[str, Any]] = []
+        for init_predicate in init or []:
+            if not isinstance(init_predicate, dict):
+                continue
+            predicate = init_predicate.get("predicate")
+            args = init_predicate.get("args", [])
+            if predicate is None or not isinstance(args, list):
+                continue
+            sanitized_init.append({
+                "predicate": str(predicate).strip(),
+                "args": [str(arg).strip() for arg in args]
+            })
+
         if not sanitized_objects and not sanitized_goals and not sanitized_locations:
             self.get_logger().error("Parsed JSON missing objects, goals, and locations")
             return None
 
-        return {"locations": sanitized_locations, "objects": sanitized_objects, "goals": sanitized_goals}
+        return {
+            "locations": sanitized_locations,
+            "objects": sanitized_objects,
+            "goals": sanitized_goals,
+            "init": sanitized_init,
+        }
 
     def _format_predicates(self, predicates: List[Dict[str, Any]]) -> str:
         """Create a compact string description of predicate list."""
