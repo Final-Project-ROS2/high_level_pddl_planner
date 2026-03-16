@@ -1026,7 +1026,7 @@ class Ros2HighLevelAgentNode(Node):
         {{{{
             "data": {{{{
                 "objects": ["B", "G", "P"],
-                "init": [{{{{"predicate": "on-table", "args": ["B"]}}}}, {{{{"predicate": "on", "args": ["G", "B"]}}}}, {{{{"predicate": "on-table", "args": ["P"]}}}}],
+                "init": [{{{{"predicate": "arm-empty", "args": []}}}}, {{{{"predicate": "on-table", "args": ["B"]}}}}, {{{{"predicate": "on", "args": ["G", "B"]}}}}, {{{{"predicate": "on-table", "args": ["P"]}}}}],
                 "goals": [{{{{"predicate": "on-table", "args": ["B"]}}}}, {{{{"predicate": "on", "args": ["G", "B"]}}}}, {{{{"predicate": "on", "args": ["P", "G"]}}}}],
             }}}}
         }}}}
@@ -1042,11 +1042,11 @@ class Ros2HighLevelAgentNode(Node):
 
         Predicate hints:
         - DO NOT create new predicates
-        - clear: args [object_name]
-        - on-table: args [object_name]
-        - arm-empty: args []
-        - holding: args [object_name]
-        - on: args [object_name, object_name]
+        - clear: args [object_name] — the top surface of the object is unobstructed and nothing is stacked on it
+        - on-table: args [object_name] — the object is resting directly on the table surface
+        - arm-empty: args [] — the robot arm is not holding any object, this is ALWAYS true for the initial state
+        - holding: args [object_name] — the robot arm is currently grasping the specified object
+        - on: args [object_name, object_name] — the first object is stacked directly on top of the second object
         """
 
         return system_message
@@ -1081,13 +1081,13 @@ class Ros2HighLevelAgentNode(Node):
 
         Predicate hints:
         - DO NOT create new predicates
-        - room: args [room_name]
-        - ball: args [ball_name]
-        - gripper: args [gripper_name]
-        - at-robby: args [room_name]
-        - at: args [ball_name, room_name]
-        - free: args [gripper_name]
-        - carry: args [object_name, gripper_name]
+        - room: args [room_name] — declares that the argument is a room (type declaration)
+        - ball: args [ball_name] — declares that the argument is a ball (type declaration)
+        - gripper: args [gripper_name] — declares that the argument is a gripper (type declaration)
+        - at-robby: args [room_name] — the robot is currently located in the specified room
+        - at: args [ball_name, room_name] — the specified ball is currently located in the specified room
+        - free: args [gripper_name] — the specified gripper is not holding any object and is available to pick up
+        - carry: args [object_name, gripper_name] — the specified gripper is currently holding the specified object
         """
 
         return system_message
