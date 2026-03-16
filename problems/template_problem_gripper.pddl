@@ -5,7 +5,7 @@
   (:objects
     {%- for obj in data.objects %}
     {{obj}}
-    {%- endif %}
+    {%- endfor %}
   )
   (:init
     {%- for init in data.init %}

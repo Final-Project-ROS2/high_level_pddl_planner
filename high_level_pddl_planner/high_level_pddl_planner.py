@@ -1007,8 +1007,6 @@ class Ros2HighLevelAgentNode(Node):
         - Always return the JSON structure above (objects list, goals list). Lengths may vary.
         - Object names CANNOT contain spaces, use underscore
         - Do not wrap the JSON in Markdown fences.
-        - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
-        - You may call tools like vqa if needed, but the final reply must still be the JSON described.
 
         Predicate hints:
         - DO NOT create new predicates
@@ -1048,8 +1046,6 @@ class Ros2HighLevelAgentNode(Node):
         - Always return the JSON structure above (objects list, goals list). Lengths may vary.
         - Object names CANNOT contain spaces, use underscore
         - Do not wrap the JSON in Markdown fences.
-        - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
-        - You may call tools like vqa if needed, but the final reply must still be the JSON described.
 
         Predicate hints:
         - DO NOT create new predicates

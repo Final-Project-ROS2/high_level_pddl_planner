@@ -20,7 +20,6 @@
 
 (:action stack
   :parameters  (?ob ?underob)
-  //:precondition (and  (clear ?underob) (holding ?ob) (not (= ?ob ?underob)) )
   :precondition (and  (clear ?underob) (holding ?ob))
   :effect (and (arm-empty) (clear ?ob) (on ?ob ?underob)
                (not (clear ?underob)) (not (holding ?ob))))

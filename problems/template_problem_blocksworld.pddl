@@ -1,10 +1,11 @@
 (define (problem blocksworld_pb)
   (:domain blocksworld)
+  (:requirements :strips)
 
   (:objects
     {%- for obj in data.objects %}
     {{obj}}
-    {%- endif %}
+    {%- endfor %}
   )
   (:init
     {%- for init in data.init %}
