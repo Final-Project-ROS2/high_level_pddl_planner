@@ -43,15 +43,29 @@ from langchain_ollama import ChatOllama
 
 from dotenv import load_dotenv
 
-ENV_PATH = '/home/group11/final_project_ws/src/high_level_pddl_planner/.env'
+PROJECT_ROOT = "/home/group11/final_project_ws/src/high_level_pddl_planner"
+
+ENV_PATH = Path(os.getenv("ENV_PATH", str(PROJECT_ROOT / ".env")))
 load_dotenv(dotenv_path=ENV_PATH)
 
-FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", "./fastdownward/fast-downward.py")
-TRANSFORM_PY = os.getenv("TRANSFORM_PY", "transform.py")
-TRANSFORM_BLOCKSWORLD_PY = os.getenv("TRANSFORM_BLOCKSWORLD_PY", "transform_blocksworld.py")
-TRANSFORM_GRIPPER_PY = os.getenv("TRANSFORM_GRIPPER_PY", "transform_gripper.py")
-TEMPLATE_PROBLEM = os.getenv("TEMPLATE_PROBLEM", "./template_problem.pddl")
-DOMAIN_PDDL = os.getenv("DOMAIN_PDDL", "./domain.pddl")
+FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", str(PROJECT_ROOT / "fast-downward" / "fast-downward.py"))
+TRANSFORM_PY = os.getenv("TRANSFORM_PY", str(PROJECT_ROOT / "transform" / "transform.py"))
+TRANSFORM_BLOCKSWORLD_PY = os.getenv("TRANSFORM_BLOCKSWORLD_PY", str(PROJECT_ROOT / "transform" / "transform_blocksworld.py"))
+TRANSFORM_GRIPPER_PY = os.getenv("TRANSFORM_GRIPPER_PY", str(PROJECT_ROOT / "transform" / "transform_gripper.py"))
+
+TEMPLATE_PROBLEM = os.getenv("TEMPLATE_PROBLEM", str(PROJECT_ROOT / "problems" / "template_problem.pddl"))
+TEMPLATE_PROBLEM_BLOCKSWORLD = os.getenv(
+    "TEMPLATE_PROBLEM_BLOCKSWORLD",
+    str(PROJECT_ROOT / "problems" / "template_problem_blocksworld.pddl"),
+)
+TEMPLATE_PROBLEM_GRIPPER = os.getenv(
+    "TEMPLATE_PROBLEM_GRIPPER",
+    str(PROJECT_ROOT / "problems" / "template_problem_gripper.pddl"),
+)
+
+DOMAIN_PDDL = os.getenv("DOMAIN_PDDL", str(PROJECT_ROOT / "domains" / "domain.pddl"))
+DOMAIN_PDDL_BLOCKSWORLD = os.getenv("DOMAIN_PDDL_BLOCKSWORLD", str(PROJECT_ROOT / "domains" / "domain_blocksworld.pddl"))
+DOMAIN_PDDL_GRIPPER = os.getenv("DOMAIN_PDDL_GRIPPER", str(PROJECT_ROOT / "domains" / "domain_gripper.pddl"))
 
 SCENE_DESC_MODES = {"default", "custom", "disabled"}
 DOMAIN_MODES = {"default", "blocksworld", "gripper"}
@@ -522,9 +536,14 @@ class Ros2HighLevelAgentNode(Node):
             self.get_logger().info(f"JSON data saved to {json_path}")
             self.get_logger().debug(f"JSON data:\n{json.dumps(json_data, indent=2)}")
 
+            template_problem = self._get_template_problem_path()
+            domain_pddl = self._get_domain_pddl_path()
+
             # Call transform.py to generate problem PDDL
-            self.get_logger().info(f"Calling transform.py to generate problem file...")
-            transform_result = self._run_transform(TEMPLATE_PROBLEM, str(json_path), str(problem_path))
+            self.get_logger().info(
+                f"Calling transform.py to generate problem file with template: {template_problem}"
+            )
+            transform_result = self._run_transform(template_problem, str(json_path), str(problem_path))
             
             if not transform_result or not problem_path.exists():
                 msg = "Failed to generate PDDL problem file. Transform failed."
@@ -536,7 +555,7 @@ class Ros2HighLevelAgentNode(Node):
 
             # Run Fast Downward with domain.pddl and generated problem.pddl
             self.response_pub.publish(String(data="Solving the PDDL problem using Fast Downward"))
-            plan_result = self._run_fast_downward(DOMAIN_PDDL, str(problem_path))
+            plan_result = self._run_fast_downward(domain_pddl, str(problem_path))
 
             if start_time is not None:
                 end_time = time.perf_counter()
@@ -840,6 +859,20 @@ class Ros2HighLevelAgentNode(Node):
             parts.append(f"{name} {arg_str}".strip())
         return "; ".join(parts) if parts else "unknown"
 
+    def _get_template_problem_path(self) -> str:
+        if self.domain_mode == "blocksworld":
+            return TEMPLATE_PROBLEM_BLOCKSWORLD
+        if self.domain_mode == "gripper":
+            return TEMPLATE_PROBLEM_GRIPPER
+        return TEMPLATE_PROBLEM
+
+    def _get_domain_pddl_path(self) -> str:
+        if self.domain_mode == "blocksworld":
+            return DOMAIN_PDDL_BLOCKSWORLD
+        if self.domain_mode == "gripper":
+            return DOMAIN_PDDL_GRIPPER
+        return DOMAIN_PDDL
+
     def _compose_step_instruction(self, step_text: str, actions_completed: List[str]) -> str:
         """Attach workspace context, initial state, and prior steps to the current instruction."""
         if self.scene_desc_mode == "disabled":
@@ -960,35 +993,30 @@ class Ros2HighLevelAgentNode(Node):
         Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
         {{{{
             "data": {{{{
-                "locations": ["left-of-gear"],
-                "objects": ["gear", "bolt"],
-                "goals": [{{{{"predicate": "gripper-close", "args": []}}}}]
+                "objects": ["B", "G", "P"],
+                "init": [{{{{"predicate": "on-table", "args": ["B"]}}}}, {{{{"predicate": "on", "args": ["G", "B"]}}}}, {{{{"predicate": "on-table", "args": ["P"]}}}}],
+                "goals": [{{{{"predicate": "on-table", "args": ["B"]}}}}, {{{{"predicate": "on", "args": ["G", "B"]}}}}, {{{{"predicate": "on", "args": ["P", "G"]}}}}],
             }}}}
         }}}}
         Where
-        - locations are task-specific locations needed to complete the instruction.
         - objects are the objects present in the workspace
+        - init are the CURRENT state predicates
         - goals are the desired FINAL state.
-        DO NOT put intermediate goals in the goals list.
-        - If the user ask to "handover" or "hand me" an object, the requested object should be located at handover
 
         Requirements:
         - Always return the JSON structure above (objects list, goals list). Lengths may vary.
         - Object names CANNOT contain spaces, use underscore
         - Do not wrap the JSON in Markdown fences.
-        - You can add modifiers to the object name, like screwdriver_leftmost, so you DO NOT need to ask clarifying questions
         - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
         - You may call tools like vqa if needed, but the final reply must still be the JSON described.
 
         Predicate hints:
         - DO NOT create new predicates
-        - gripper-open: args []
-        - gripper-close: args []
-        - robot-at-location: args [location_name]
-        - robot-at-object: args [object_name]
-        - object-at-location: args [object_name, location_name]
-        - robot-have: args [object_name]
-        - Available locations: home, ready, handover
+        - clear: args [object_name]
+        - on-table: args [object_name]
+        - arm-empty: args []
+        - holding: args [object_name]
+        - on: args [object_name, object_name]
         """
 
         return system_message
@@ -1006,35 +1034,32 @@ class Ros2HighLevelAgentNode(Node):
         Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
         {{{{
             "data": {{{{
-                "locations": ["left-of-gear"],
-                "objects": ["gear", "bolt"],
-                "goals": [{{{{"predicate": "gripper-close", "args": []}}}}]
+                "objects": ["roomA", "roomB", "Ball1", "Ball2", "left", "right"],
+                "init": [{{{{"predicate": "room", "args": ["roomA"]}}}}, {{{{"predicate": "room", "args": ["roomB"]}}}}, {{{{"predicate": "ball", "args": ["Ball1"]}}}}, {{{{"predicate": "ball", "args": ["Ball2"]}}}}, {{{{"predicate": "gripper", "args": ["left"]}}}}, {{{{"predicate": "gripper", "args": ["right"]}}}}, {{{{"predicate": "at-robby", "args": ["roomA"]}}}}, {{{{"predicate": "free", "args": ["left"]}}}}, {{{{"predicate": "free", "args": ["right"]}}}}, {{{{"predicate": "at", "args": ["Ball1", "roomA"]}}}}, {{{{"predicate": "at", "args": ["Ball2", "roomA"]}}}}],
+                "goals": [{{{{"predicate": "at", "args": ["Ball1", "roomB"]}}}}, {{{{"predicate": "at", "args": ["Ball2", "roomB"]}}}}]
             }}}}
         }}}}
         Where
-        - locations are task-specific locations needed to complete the instruction.
-        - objects are the objects present in the workspace
+        - objects are the ball, gripper, and room present in the problem
+        - init are the CURRENT state predicates
         - goals are the desired FINAL state.
-        DO NOT put intermediate goals in the goals list.
-        - If the user ask to "handover" or "hand me" an object, the requested object should be located at handover
 
         Requirements:
         - Always return the JSON structure above (objects list, goals list). Lengths may vary.
         - Object names CANNOT contain spaces, use underscore
         - Do not wrap the JSON in Markdown fences.
-        - You can add modifiers to the object name, like screwdriver_leftmost, so you DO NOT need to ask clarifying questions
         - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
         - You may call tools like vqa if needed, but the final reply must still be the JSON described.
 
         Predicate hints:
         - DO NOT create new predicates
-        - gripper-open: args []
-        - gripper-close: args []
-        - robot-at-location: args [location_name]
-        - robot-at-object: args [object_name]
-        - object-at-location: args [object_name, location_name]
-        - robot-have: args [object_name]
-        - Available locations: home, ready, handover
+        - room: args [room_name]
+        - ball: args [ball_name]
+        - gripper: args [gripper_name]
+        - at-robby: args [room_name]
+        - at: args [ball_name, room_name]
+        - free: args [gripper_name]
+        - carry: args [object_name, gripper_name]
         """
 
         return system_message
