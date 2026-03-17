@@ -1041,6 +1041,7 @@ class Ros2HighLevelAgentNode(Node):
         - Always return the JSON structure above (objects list, goals list). Lengths may vary.
         - Object names CANNOT contain spaces, use underscore
         - Colored blocks are represented by their color initial in lowercase: r=red, g=green, b=blue, y=yellow, p=purple
+        - Follow the instruction even if there are inconsistencies with the initial state (e.g. if the user says "place the red block on the table" but there is no red block in the initial state, you can still include "red_block" in the objects and goals as needed to fulfill the instruction)
         - Do not wrap the JSON in Markdown fences.
 
         Predicate hints:
