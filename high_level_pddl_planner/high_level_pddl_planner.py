@@ -749,7 +749,7 @@ class Ros2HighLevelAgentNode(Node):
 
     def _run_fast_downward(self, domain_file: str, problem_file: str, timeout: int = 300) -> PlanningResult:
         """Call Fast Downward to produce a plan."""
-        workdir = str(Path(domain_file).parent)
+        workdir = str(Path(problem_file).parent)
         cmd = ["python3", FAST_DOWNWARD_PY, domain_file, problem_file, "--search", "astar(lmcut())"]
         self.get_logger().info(f"Calling Fast Downward: {' '.join(cmd)} (workdir={workdir})")
         try:
