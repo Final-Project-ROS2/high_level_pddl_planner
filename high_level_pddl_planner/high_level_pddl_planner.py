@@ -949,7 +949,8 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().error(f"Exception when sending to VQA: {e}")
                 return None
 
-        tools.append(vqa)
+        if self.domain_mode == "default":
+            tools.append(vqa)
 
         return tools
 
@@ -1038,11 +1039,12 @@ class Ros2HighLevelAgentNode(Node):
         Requirements:
         - Always return the JSON structure above (objects list, goals list). Lengths may vary.
         - Object names CANNOT contain spaces, use underscore
+        - Colored blocks are represented by their color initial in lowercase: r=red, g=green, b=blue, y=yellow, p=purple
         - Do not wrap the JSON in Markdown fences.
 
         Predicate hints:
         - DO NOT create new predicates
-        - clear: args [object_name] — the top surface of the object is unobstructed and nothing is stacked on it
+        - clear: args [object_name] — if the object has nothing on top of it (alone or top of a stack), you MUST include clear
         - on-table: args [object_name] — the object is resting directly on the table surface
         - arm-empty: args [] — the robot arm is not holding any object, this is ALWAYS true for the initial state
         - holding: args [object_name] — the robot arm is currently grasping the specified object
