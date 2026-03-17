@@ -444,6 +444,7 @@ class Ros2HighLevelAgentNode(Node):
                     scene_from_request = "Scene description unavailable"
                 with self._init_lock:
                     self.scene_description = scene_from_request
+                self.get_logger().info(f"scene_desc=custom: using scene description from request: {scene_from_request}")
                 self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_from_request)
             elif self.scene_desc_mode == "disabled":
                 self.scene_description = None
@@ -1157,6 +1158,7 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().info(f"High-level Prompt action received: {goal_text}")
 
                 request_scene_desc = getattr(goal_handle.request, "scene_desc", None)
+                self.get_logger().info(f"Scene description attached to request: {request_scene_desc}")
                 steps = self._generate_plan(
                     goal_text,
                     start_time=self.start_time,
