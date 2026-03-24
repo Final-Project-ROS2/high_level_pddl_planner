@@ -181,6 +181,7 @@ class Ros2HighLevelAgentNode(Node):
         )
 
         self.response_pub = self.create_publisher(String, "/response", 10)
+        self.tts_pub = self.create_publisher(String, "/tts", 10)
         self.benchmark_pub = self.create_publisher(String, "/benchmark_logs", 10)
 
         if self.scene_desc_mode == "default":
@@ -213,6 +214,49 @@ class Ros2HighLevelAgentNode(Node):
             f"Valid values: {sorted(valid_values)}"
         )
         return fallback
+
+    def _format_for_tts(self, text: str) -> str:
+        """
+        Convert text to a format suitable for text-to-speech.
+        - Removes excessive formatting characters
+        - Converts numbered lists to natural language
+        - Simplifies technical jargon
+        - Makes text more conversational
+        """
+        if not text:
+            return ""
+        
+        # Replace multiple newlines with single space
+        tts_text = text.replace("\n", " ").replace("\r", " ")
+        
+        # Replace multiple spaces with single space
+        tts_text = " ".join(tts_text.split())
+        
+        # Convert numbered list items (e.g., "1. Do X" -> "Step one, do X")
+        tts_text = re.sub(r'^\d+\.\s+', lambda m: f"Step {self._number_to_word(int(m.group(0).split('.')[0]))}, ", tts_text)
+        
+        # Remove trailing punctuation that doesn't help TTS (multiple exclamation marks, question marks)
+        tts_text = re.sub(r'([!?])\1+', r'\1', tts_text)
+        
+        # Simplify "PDDL" references in speech
+        tts_text = tts_text.replace(" PDDL ", " ")
+        tts_text = tts_text.replace("PDDL planning", "planning")
+        
+        return tts_text.strip()
+    
+    def _number_to_word(self, num: int) -> str:
+        """Convert a number to its word representation (1-20, and tens)"""
+        ones = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+                "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+                "seventeen", "eighteen", "nineteen"]
+        tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+        
+        if num < 20:
+            return ones[num]
+        elif num < 100:
+            return tens[num // 10] + ("" if num % 10 == 0 else " " + ones[num % 10])
+        else:
+            return str(num)  # For larger numbers, just use str representation
 
     def _benchmark_log(self, label: str):
         t = self.get_clock().now()
@@ -307,6 +351,7 @@ class Ros2HighLevelAgentNode(Node):
             
             self.get_logger().info(f"Scene description obtained: {self.scene_description}")
             self.response_pub.publish(String(data=f"Scene analysis: {self.scene_description}"))
+            self.tts_pub.publish(String(data=self._format_for_tts(f"I've analyzed the scene. {self.scene_description}")))
             
         except Exception as e:
             self.get_logger().error(f"Exception during scene initialization: {e}")
@@ -404,6 +449,7 @@ class Ros2HighLevelAgentNode(Node):
         if not self.initialized:
             self.get_logger().warn("Node not fullly initialized yet. Ignoring transcript.")
             self.response_pub.publish(String(data="Still initializing, please wait a moment..."))
+            self.tts_pub.publish(String(data="Still initializing, please wait a moment."))
 
         start_time = time.perf_counter()
         self._benchmark_log("transcript_received")
@@ -433,7 +479,9 @@ class Ros2HighLevelAgentNode(Node):
         try:
             self.get_logger().info("High-level agent (PDDL): generating plan with fixed domain...")
             self.response_pub.publish(String(data="Got it! Let me think through that..."))
+            self.tts_pub.publish(String(data="Got it. Let me think through that."))
             self.response_pub.publish(String(data="Analyzing scene and determining current state"))
+            self.tts_pub.publish(String(data="Analyzing the scene and determining the current state."))
 
             if self.scene_desc_mode == "custom":
                 scene_from_request = (request_scene_desc or "").strip()
@@ -506,17 +554,20 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().info(f"Agent requests clarification: {clarification}")
                 self.chat_history.append({"role": "assistant", "content": clarification})
                 self.response_pub.publish(String(data=clarification))
+                self.tts_pub.publish(String(data=self._format_for_tts(clarification)))
                 return []
 
             self.chat_history.append({"role": "assistant", "content": final_text})
 
             self.response_pub.publish(String(data="Generating planning data and PDDL problem file"))
+            self.tts_pub.publish(String(data="Generating planning data."))
 
             planning_payload = self._parse_planning_json(final_text)
             if not planning_payload:
                 msg = "Hmm... I couldn't generate valid planning data. Could you try rephrasing that?"
                 self.get_logger().error("LLM response could not be parsed into planning JSON.")
                 self.response_pub.publish(String(data=msg))
+                self.tts_pub.publish(String(data=self._format_for_tts(msg)))
                 return []
 
             if self.domain_mode != "default":
@@ -559,12 +610,14 @@ class Ros2HighLevelAgentNode(Node):
                 msg = "Failed to generate PDDL problem file. Transform failed."
                 self.get_logger().error("Transform failed or problem file not created.")
                 self.response_pub.publish(String(data=msg))
+                self.tts_pub.publish(String(data="Failed to generate the planning file. Please try again."))
                 return []
 
             self.get_logger().debug(f"Problem:\n{problem_path.read_text()}")
 
             # Run Fast Downward with domain.pddl and generated problem.pddl
             self.response_pub.publish(String(data="Solving the PDDL problem using Fast Downward"))
+            self.tts_pub.publish(String(data="Now solving the planning problem."))
             plan_result = self._run_fast_downward(domain_pddl, str(problem_path))
 
             if start_time is not None:
@@ -576,6 +629,7 @@ class Ros2HighLevelAgentNode(Node):
                 msg = f"I couldn't find a valid plan. The planner returned: {plan_result.status}"
                 self.get_logger().warn(f"Planner returned no plan. status={plan_result.status} rc={plan_result.return_code}")
                 self.response_pub.publish(String(data=msg))
+                self.tts_pub.publish(String(data="I couldn't find a valid plan for that request. Could you try rephrasing it?"))
                 # Keep last_goal_state intact - planning failed but state hasn't changed
                 return []
 
@@ -585,6 +639,7 @@ class Ros2HighLevelAgentNode(Node):
                 msg = "No actionable steps could be parsed from the plan."
                 self.get_logger().warn("No actionable plan lines parsed.")
                 self.response_pub.publish(String(data=msg))
+                self.tts_pub.publish(String(data="I couldn't parse the plan into steps. Please try again."))
                 # Keep last_goal_state intact - parsing failed but state hasn't changed
                 return []
 
@@ -595,10 +650,14 @@ class Ros2HighLevelAgentNode(Node):
                 self.response_pub.publish(String(
                     data=f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and confirm if this looks good!"
                 ))
+                # Create a more natural TTS version of the plan
+                tts_plan = ". ".join([s for s in plan_lines])
+                self.tts_pub.publish(String(data=f"Here is my plan: {tts_plan}. Please confirm if this looks good."))
                 self.get_logger().info(f"Generated plan with {len(plan_lines)} steps, waiting for /confirm.")
             else:
                 def execute_plan():
                     self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
+                    self.tts_pub.publish(String(data="Executing the plan now."))
                     self.get_logger().info("Executing confirmed plan...")
 
                     for i, step in enumerate(self.latest_plan, start=1):
@@ -606,11 +665,13 @@ class Ros2HighLevelAgentNode(Node):
                         step_payload = self._compose_step_instruction(step, actions_completed)
 
                         self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
+                        self.tts_pub.publish(String(data=self._format_for_tts(f"Step {i}: {step}")))
                         result = self.send_step_to_medium_async(step_payload)
 
                         if result is None or not result.success:
                             msg = f"Step {i} failed: {step}. Stopping execution."
                             self.response_pub.publish(String(data=msg))
+                            self.tts_pub.publish(String(data=f"Step {i} failed. Stopping execution."))
                             self.get_logger().error(msg)
                             # Clear last goal state on execution failure - state is now uncertain after partial execution
                             self.last_goal_state = None
@@ -618,12 +679,14 @@ class Ros2HighLevelAgentNode(Node):
                         else:
                             done_msg = f"Step {i} completed successfully."
                             self.response_pub.publish(String(data=done_msg))
+                            self.tts_pub.publish(String(data=f"Step {i} completed."))
                             self.get_logger().info(done_msg)
 
                     end_time = time.perf_counter()
                     benchmark_info = f"High-level action completed in {end_time - self.start_time:.2f} seconds."
                     self.benchmark_pub.publish(String(data=benchmark_info))
                     self.response_pub.publish(String(data="Plan execution finished."))
+                    self.tts_pub.publish(String(data="Plan execution finished."))
                     self.get_logger().info("All steps done. Storing goal state for continuous tracking.")
                     
                     # Store goal state from successfully executed plan for next instruction
@@ -644,6 +707,7 @@ class Ros2HighLevelAgentNode(Node):
         except Exception as e:
             self.get_logger().error(f"Error generating plan: {e}")
             self.response_pub.publish(String(data="Sorry, something went wrong while planning."))
+            self.tts_pub.publish(String(data="Sorry, something went wrong. Please try again."))
             # Keep last_goal_state intact - planning exception but state hasn't changed
             return []
 
@@ -653,16 +717,19 @@ class Ros2HighLevelAgentNode(Node):
             response.success = False
             response.message = "Node not yet initialized. Please wait for scene analysis to complete."
             self.response_pub.publish(String(data=response.message))
+            self.tts_pub.publish(String(data="Node is still initializing. Please wait."))
             return response
 
         if not self.latest_plan:
             response.success = False
             response.message = "No plan to confirm. Please give a new instruction first."
             self.response_pub.publish(String(data=response.message))
+            self.tts_pub.publish(String(data="No plan to confirm. Please give me a new instruction."))
             return response
 
         def execute_plan():
             self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
+            self.tts_pub.publish(String(data="Executing the plan now."))
             self.get_logger().info("Executing confirmed plan...")
 
             for i, step in enumerate(self.latest_plan, start=1):
@@ -670,11 +737,13 @@ class Ros2HighLevelAgentNode(Node):
                 step_payload = self._compose_step_instruction(step, actions_completed)
 
                 self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
+                self.tts_pub.publish(String(data=self._format_for_tts(f"Step {i}: {step}")))
                 result = self.send_step_to_medium_async(step_payload)
 
                 if result is None or not result.success:
                     msg = f"Step {i} failed: {step}. Stopping execution."
                     self.response_pub.publish(String(data=msg))
+                    self.tts_pub.publish(String(data=f"Step {i} failed. Stopping execution."))
                     self.get_logger().error(msg)
                     # Clear last goal state on execution failure - state is now uncertain after partial execution
                     self.last_goal_state = None
@@ -682,9 +751,11 @@ class Ros2HighLevelAgentNode(Node):
                 else:
                     done_msg = f"Step {i} completed successfully."
                     self.response_pub.publish(String(data=done_msg))
+                    self.tts_pub.publish(String(data=f"Step {i} completed."))
                     self.get_logger().info(done_msg)
 
             self.response_pub.publish(String(data="Plan execution finished."))
+            self.tts_pub.publish(String(data="Plan execution finished."))
             self.get_logger().info("All steps done. Storing goal state for continuous tracking.")
             
             # Store goal state from successfully executed plan for next instruction
@@ -716,6 +787,7 @@ class Ros2HighLevelAgentNode(Node):
         response.message = "State has been reset. Ready for new instructions."
         self.get_logger().info("State reset via /reset_state service")
         self.response_pub.publish(String(data=response.message))
+        self.tts_pub.publish(String(data=response.message))
         return response
 
     # -----------------------
