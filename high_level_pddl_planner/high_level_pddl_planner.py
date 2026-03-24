@@ -23,7 +23,7 @@ from std_srvs.srv import SetBool, Trigger
 from std_msgs.msg import String
 from geometry_msgs.msg import Pose
 
-from custom_interfaces.action import Prompt
+from custom_interfaces.action import Prompt, PromptScene
 from custom_interfaces.srv import (
     DetectObjects,
     ClassifyBBox,
@@ -43,13 +43,32 @@ from langchain_ollama import ChatOllama
 
 from dotenv import load_dotenv
 
-ENV_PATH = '/home/group11/final_project_ws/src/high_level_pddl_planner/.env'
+PROJECT_ROOT = Path("/home/group11/final_project_ws/src/high_level_pddl_planner")
+
+ENV_PATH = Path(os.getenv("ENV_PATH", str(PROJECT_ROOT / ".env")))
 load_dotenv(dotenv_path=ENV_PATH)
 
-FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", "./fastdownward/fast-downward.py")
-TRANSFORM_PY = os.getenv("TRANSFORM_PY", "transform.py")
-TEMPLATE_PROBLEM = os.getenv("TEMPLATE_PROBLEM", "./template_problem.pddl")
-DOMAIN_PDDL = os.getenv("DOMAIN_PDDL", "./domain.pddl")
+FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", str(PROJECT_ROOT / "fast-downward" / "fast-downward.py"))
+TRANSFORM_PY = os.getenv("TRANSFORM_PY", str(PROJECT_ROOT / "transform" / "transform.py"))
+TRANSFORM_BLOCKSWORLD_PY = os.getenv("TRANSFORM_BLOCKSWORLD_PY", str(PROJECT_ROOT / "transform" / "transform_blocksworld.py"))
+TRANSFORM_GRIPPER_PY = os.getenv("TRANSFORM_GRIPPER_PY", str(PROJECT_ROOT / "transform" / "transform_gripper.py"))
+
+TEMPLATE_PROBLEM = os.getenv("TEMPLATE_PROBLEM", str(PROJECT_ROOT / "problems" / "template_problem.pddl"))
+TEMPLATE_PROBLEM_BLOCKSWORLD = os.getenv(
+    "TEMPLATE_PROBLEM_BLOCKSWORLD",
+    str(PROJECT_ROOT / "problems" / "template_problem_blocksworld.pddl"),
+)
+TEMPLATE_PROBLEM_GRIPPER = os.getenv(
+    "TEMPLATE_PROBLEM_GRIPPER",
+    str(PROJECT_ROOT / "problems" / "template_problem_gripper.pddl"),
+)
+
+DOMAIN_PDDL = os.getenv("DOMAIN_PDDL", str(PROJECT_ROOT / "domains" / "domain.pddl"))
+DOMAIN_PDDL_BLOCKSWORLD = os.getenv("DOMAIN_PDDL_BLOCKSWORLD", str(PROJECT_ROOT / "domains" / "domain_blocksworld.pddl"))
+DOMAIN_PDDL_GRIPPER = os.getenv("DOMAIN_PDDL_GRIPPER", str(PROJECT_ROOT / "domains" / "domain_gripper.pddl"))
+
+SCENE_DESC_MODES = {"default", "custom", "disabled"}
+DOMAIN_MODES = {"default", "blocksworld", "gripper"}
 
 class PDDLGenerationResult:
     def __init__(self, json_data: Dict[str, Any]):
@@ -82,6 +101,18 @@ class Ros2HighLevelAgentNode(Node):
         self.use_ollama: bool = self.get_parameter("use_ollama").get_parameter_value().bool_value
         self.declare_parameter("confirm", True)
         self.confirm: bool = self.get_parameter("confirm").get_parameter_value().bool_value
+
+        self.declare_parameter("scene_desc", "default")
+        raw_scene_desc_mode = self.get_parameter("scene_desc").get_parameter_value().string_value
+        self.scene_desc_mode = self._validate_enum_parameter("scene_desc", raw_scene_desc_mode, SCENE_DESC_MODES)
+
+        self.declare_parameter("domain", "default")
+        raw_domain_mode = self.get_parameter("domain").get_parameter_value().string_value
+        self.domain_mode = self._validate_enum_parameter("domain", raw_domain_mode, DOMAIN_MODES)
+
+        self.get_logger().info(
+            f"Planner configuration: scene_desc={self.scene_desc_mode}, domain={self.domain_mode}"
+        )
 
         self.declare_parameter("ollama_model", "gpt-oss:20b")
         self.ollama_model: str = self.get_parameter("ollama_model").get_parameter_value().string_value
@@ -138,9 +169,11 @@ class Ros2HighLevelAgentNode(Node):
         self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
         self.reset_state_srv = self.create_service(Trigger, "/reset_state", self.reset_state_callback)
 
+        self.high_level_action_type = PromptScene if self.scene_desc_mode == "custom" else Prompt
+
         self._action_server = ActionServer(
             self,
-            Prompt,
+            self.high_level_action_type,
             "prompt_high_level",
             execute_callback=self.execute_callback,
             goal_callback=self.goal_callback,
@@ -151,12 +184,36 @@ class Ros2HighLevelAgentNode(Node):
         self.tts_pub = self.create_publisher(String, "/tts", 10)
         self.benchmark_pub = self.create_publisher(String, "/benchmark_logs", 10)
 
-        self.get_logger().info("Ros2 High-Level Agent Node initialized. Fetching scene description...")
+        if self.scene_desc_mode == "default":
+            self.get_logger().info("Ros2 High-Level Agent Node initialized. Fetching scene description...")
+            init_thread = threading.Thread(target=self._initialize_scene_description, daemon=False)
+            init_thread.start()
+            self.get_logger().info("Ros2 High-Level Agent Node ready (waiting for scene description before accepting requests).")
+        else:
+            if self.scene_desc_mode == "custom":
+                self.scene_description = "Scene description provided via /prompt_high_level requests"
+            else:
+                self.scene_description = None
 
-        init_thread = threading.Thread(target=self._initialize_scene_description, daemon=False)
-        init_thread.start()
+            self.agent_executor = self._create_pddl_agent_executor(
+                scene_desc=self.scene_description if self.scene_desc_mode != "disabled" else None
+            )
+            with self._init_lock:
+                self.initialized = True
+            self.get_logger().info(
+                "Ros2 High-Level Agent Node ready (scene initialization via /vqa is disabled by configuration)."
+            )
 
-        self.get_logger().info("Ros2 High-Level Agent Node ready (waiting for scene description before accepting requests).")
+    def _validate_enum_parameter(self, name: str, value: str, valid_values: set) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized in valid_values:
+            return normalized
+        fallback = "default" if "default" in valid_values else sorted(valid_values)[0]
+        self.get_logger().warn(
+            f"Invalid value '{value}' for parameter '{name}'. Falling back to '{fallback}'. "
+            f"Valid values: {sorted(valid_values)}"
+        )
+        return fallback
 
     def _format_for_tts(self, text: str) -> str:
         """
@@ -380,6 +437,15 @@ class Ros2HighLevelAgentNode(Node):
         if not text:
             return
 
+        if self.scene_desc_mode == "custom":
+            warn_msg = (
+                "scene_desc=custom requires /prompt_high_level action requests with scene_desc. "
+                "Transcript input is ignored in this mode."
+            )
+            self.get_logger().warn(warn_msg)
+            self.response_pub.publish(String(data=warn_msg))
+            return
+
         if not self.initialized:
             self.get_logger().warn("Node not fullly initialized yet. Ignoring transcript.")
             self.response_pub.publish(String(data="Still initializing, please wait a moment..."))
@@ -398,7 +464,12 @@ class Ros2HighLevelAgentNode(Node):
         )
         plan_thread.start()
 
-    def _generate_plan(self, instruction_text: str, start_time: Optional[float] = None) -> List[str]:
+    def _generate_plan(
+        self,
+        instruction_text: str,
+        start_time: Optional[float] = None,
+        request_scene_desc: Optional[str] = None,
+    ) -> List[str]:
         """Generate a plan using fixed domain and dynamic problem generation."""
         self.chat_history.append({"role": "user", "content": instruction_text})
 
@@ -412,24 +483,51 @@ class Ros2HighLevelAgentNode(Node):
             self.response_pub.publish(String(data="Analyzing scene and determining current state"))
             self.tts_pub.publish(String(data="Analyzing the scene and determining the current state."))
 
-            # Get current state from services
-            current_state = self._get_current_state()
-            
-            # Convert current state to init predicates for PDDL template
-            init_predicates = self._state_to_init_predicates(current_state)
-            
-            # Merge with last goal state if available (continuous state tracking)
-            if self.last_goal_state:
-                self.get_logger().info(f"Merging previous goal state into init: {self.last_goal_state}")
-                # Add previous goals to init, avoiding duplicates
-                existing_predicates = {(p["predicate"], tuple(p.get("args", []))): p for p in init_predicates}
-                for goal in self.last_goal_state:
-                    key = (goal["predicate"], tuple(goal.get("args", [])))
-                    if key not in existing_predicates:
-                        init_predicates.append(goal)
-                self.get_logger().info(f"Combined init predicates: {init_predicates}")
+            if self.scene_desc_mode == "custom":
+                scene_from_request = (request_scene_desc or "").strip()
+                if not scene_from_request:
+                    self.get_logger().warn(
+                        "scene_desc=custom but request scene_desc is empty. Falling back to placeholder."
+                    )
+                    scene_from_request = "Scene description unavailable"
+                with self._init_lock:
+                    self.scene_description = scene_from_request
+                self.get_logger().info(f"scene_desc=custom: using scene description from request: {scene_from_request}")
+                self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_from_request)
+            elif self.scene_desc_mode == "disabled":
+                self.scene_description = None
+                if self.agent_executor is None:
+                    self.agent_executor = self._create_pddl_agent_executor(scene_desc=None)
+            elif self.agent_executor is None:
+                with self._init_lock:
+                    current_scene = self.scene_description
+                self.agent_executor = self._create_pddl_agent_executor(scene_desc=current_scene)
 
-            self.initial_state_summary = self._format_predicates(init_predicates)
+            if self.agent_executor is None:
+                raise RuntimeError("Agent executor is not initialized")
+
+            init_predicates: List[Dict[str, Any]] = []
+            if self.domain_mode == "default":
+                # Get current state from services
+                current_state = self._get_current_state()
+
+                # Convert current state to init predicates for PDDL template
+                init_predicates = self._state_to_init_predicates(current_state)
+
+                # Merge with last goal state if available (continuous state tracking)
+                if self.last_goal_state:
+                    self.get_logger().info(f"Merging previous goal state into init: {self.last_goal_state}")
+                    # Add previous goals to init, avoiding duplicates
+                    existing_predicates = {(p["predicate"], tuple(p.get("args", []))): p for p in init_predicates}
+                    for goal in self.last_goal_state:
+                        key = (goal["predicate"], tuple(goal.get("args", [])))
+                        if key not in existing_predicates:
+                            init_predicates.append(goal)
+                    self.get_logger().info(f"Combined init predicates: {init_predicates}")
+            else:
+                self.get_logger().info(
+                    f"domain={self.domain_mode}: skipping state service init predicates; expecting init from LLM output."
+                )
 
             # Build LangChain chat history
             langchain_history = []
@@ -472,6 +570,11 @@ class Ros2HighLevelAgentNode(Node):
                 self.tts_pub.publish(String(data=self._format_for_tts(msg)))
                 return []
 
+            if self.domain_mode != "default":
+                init_predicates = planning_payload.get("init", [])
+
+            self.initial_state_summary = self._format_predicates(init_predicates)
+
             json_gen_data = {
                 "locations": planning_payload.get("locations", []),
                 "objects": planning_payload.get("objects", []),
@@ -494,9 +597,14 @@ class Ros2HighLevelAgentNode(Node):
             self.get_logger().info(f"JSON data saved to {json_path}")
             self.get_logger().debug(f"JSON data:\n{json.dumps(json_data, indent=2)}")
 
+            template_problem = self._get_template_problem_path()
+            domain_pddl = self._get_domain_pddl_path()
+
             # Call transform.py to generate problem PDDL
-            self.get_logger().info(f"Calling transform.py to generate problem file...")
-            transform_result = self._run_transform(TEMPLATE_PROBLEM, str(json_path), str(problem_path))
+            self.get_logger().info(
+                f"Calling transform.py to generate problem file with template: {template_problem}"
+            )
+            transform_result = self._run_transform(template_problem, str(json_path), str(problem_path))
             
             if not transform_result or not problem_path.exists():
                 msg = "Failed to generate PDDL problem file. Transform failed."
@@ -510,7 +618,7 @@ class Ros2HighLevelAgentNode(Node):
             # Run Fast Downward with domain.pddl and generated problem.pddl
             self.response_pub.publish(String(data="Solving the PDDL problem using Fast Downward"))
             self.tts_pub.publish(String(data="Now solving the planning problem."))
-            plan_result = self._run_fast_downward(DOMAIN_PDDL, str(problem_path))
+            plan_result = self._run_fast_downward(domain_pddl, str(problem_path))
 
             if start_time is not None:
                 end_time = time.perf_counter()
@@ -686,11 +794,18 @@ class Ros2HighLevelAgentNode(Node):
     # JSON and Transform helpers
     # -----------------------
     def _run_transform(self, template_file: str, data_json_file: str, output_file: str) -> bool:
-        """Call transform.py to generate problem PDDL from template and JSON data."""
+        """Call the appropriate transform script to generate problem PDDL from template and JSON data."""
         workdir = str(Path(template_file).parent)
 
-        cmd = ["python3", TRANSFORM_PY, template_file, data_json_file, output_file]
-        self.get_logger().info(f"Calling transform.py: {' '.join(cmd)} (workdir={workdir})")
+        if self.domain_mode == "blocksworld":
+            transform_script = TRANSFORM_BLOCKSWORLD_PY
+        elif self.domain_mode == "gripper":
+            transform_script = TRANSFORM_GRIPPER_PY
+        else:
+            transform_script = TRANSFORM_PY
+
+        cmd = ["python3", transform_script, template_file, data_json_file, output_file]
+        self.get_logger().info(f"Calling transform script ({self.domain_mode}): {' '.join(cmd)} (workdir={workdir})")
         try:
             result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=60)
             self.get_logger().info(f"Transform stdout:\n{result.stdout}")
@@ -707,7 +822,7 @@ class Ros2HighLevelAgentNode(Node):
 
     def _run_fast_downward(self, domain_file: str, problem_file: str, timeout: int = 300) -> PlanningResult:
         """Call Fast Downward to produce a plan."""
-        workdir = str(Path(domain_file).parent)
+        workdir = str(Path(problem_file).parent)
         cmd = ["python3", FAST_DOWNWARD_PY, domain_file, problem_file, "--search", "astar(lmcut())"]
         self.get_logger().info(f"Calling Fast Downward: {' '.join(cmd)} (workdir={workdir})")
         try:
@@ -786,10 +901,15 @@ class Ros2HighLevelAgentNode(Node):
         locations = base_data.get("locations", [])
         objects = base_data.get("objects", [])
         goals = base_data.get("goals", [])
+        init = base_data.get("init", [])
 
     
         if not isinstance(objects, list) or not isinstance(goals, list) or not isinstance(locations, list):
             self.get_logger().error("JSON does not contain list fields for objects/goals/locations")
+            return None
+
+        if init is not None and not isinstance(init, list):
+            self.get_logger().error("JSON field 'init' must be a list when provided")
             return None
 
         sanitized_locations = [str(loc).strip() for loc in locations if str(loc).strip()]
@@ -808,11 +928,29 @@ class Ros2HighLevelAgentNode(Node):
                 "args": [str(arg).strip() for arg in args]
             })
 
+        sanitized_init: List[Dict[str, Any]] = []
+        for init_predicate in init or []:
+            if not isinstance(init_predicate, dict):
+                continue
+            predicate = init_predicate.get("predicate")
+            args = init_predicate.get("args", [])
+            if predicate is None or not isinstance(args, list):
+                continue
+            sanitized_init.append({
+                "predicate": str(predicate).strip(),
+                "args": [str(arg).strip() for arg in args]
+            })
+
         if not sanitized_objects and not sanitized_goals and not sanitized_locations:
             self.get_logger().error("Parsed JSON missing objects, goals, and locations")
             return None
 
-        return {"locations": sanitized_locations, "objects": sanitized_objects, "goals": sanitized_goals}
+        return {
+            "locations": sanitized_locations,
+            "objects": sanitized_objects,
+            "goals": sanitized_goals,
+            "init": sanitized_init,
+        }
 
     def _format_predicates(self, predicates: List[Dict[str, Any]]) -> str:
         """Create a compact string description of predicate list."""
@@ -826,9 +964,26 @@ class Ros2HighLevelAgentNode(Node):
             parts.append(f"{name} {arg_str}".strip())
         return "; ".join(parts) if parts else "unknown"
 
+    def _get_template_problem_path(self) -> str:
+        if self.domain_mode == "blocksworld":
+            return TEMPLATE_PROBLEM_BLOCKSWORLD
+        if self.domain_mode == "gripper":
+            return TEMPLATE_PROBLEM_GRIPPER
+        return TEMPLATE_PROBLEM
+
+    def _get_domain_pddl_path(self) -> str:
+        if self.domain_mode == "blocksworld":
+            return DOMAIN_PDDL_BLOCKSWORLD
+        if self.domain_mode == "gripper":
+            return DOMAIN_PDDL_GRIPPER
+        return DOMAIN_PDDL
+
     def _compose_step_instruction(self, step_text: str, actions_completed: List[str]) -> str:
         """Attach workspace context, initial state, and prior steps to the current instruction."""
-        workspace = self.scene_description or "unknown"
+        if self.scene_desc_mode == "disabled":
+            workspace = "scene description disabled"
+        else:
+            workspace = self.scene_description or "unknown"
         initial = self.initial_state_summary or "unknown"
         completed = "; ".join(actions_completed) if actions_completed else "none"
         return f"Workspace context: {workspace}\nInitial state: {initial}\nactions completed: {completed}\nInstruction: {step_text}"
@@ -867,22 +1022,32 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().error(f"Exception when sending to VQA: {e}")
                 return None
 
-        tools.append(vqa)
+        if self.domain_mode == "default":
+            tools.append(vqa)
 
         return tools
 
     # -----------------------
     # Create Planning Agent
     # -----------------------
-    def _create_pddl_agent_executor(self, scene_desc: Optional[str] = None) -> AgentExecutor:
-        """Create an agent that generates planning data (objects and goals) in JSON format using structured output."""
-        if scene_desc is None:
-            with self._init_lock:
-                scene_desc = self.scene_description if self.scene_description else "Scene not yet analyzed"
+    def _build_system_message(self, scene_desc: Optional[str]) -> str:
+        include_scene_desc = self.scene_desc_mode != "disabled"
+
+        if self.domain_mode == "blocksworld":
+            return self._build_blocksworld_system_message(scene_desc, include_scene_desc)
+        if self.domain_mode == "gripper":
+            return self._build_gripper_system_message(scene_desc, include_scene_desc)
+        return self._build_default_system_message(scene_desc, include_scene_desc)
+
+    def _build_default_system_message(self, scene_desc: Optional[str], include_scene_desc: bool) -> str:
+        scene_section = ""
+        if include_scene_desc:
+            effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
+            scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
 
         system_message = f"""You are a planning assistant for a robot manipulation system.
 
-        Current scene description: {scene_desc}
+        {scene_section}
 
         Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
         {{{{
@@ -917,6 +1082,99 @@ class Ros2HighLevelAgentNode(Node):
         - robot-have: args [object_name]
         - Available locations: home, ready, handover
         """
+
+        return system_message
+
+
+    def _build_blocksworld_system_message(self, scene_desc: Optional[str], include_scene_desc: bool) -> str:
+        scene_section = ""
+        if include_scene_desc:
+            effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
+            scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
+
+        system_message = f"""You are a planning assistant for a robot manipulation system.
+
+        {scene_section}
+
+        Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
+        {{{{
+            "data": {{{{
+                "objects": ["B", "G", "P"],
+                "init": [{{{{"predicate": "arm-empty", "args": []}}}}, {{{{"predicate": "on-table", "args": ["B"]}}}}, {{{{"predicate": "on", "args": ["G", "B"]}}}}, {{{{"predicate": "on-table", "args": ["P"]}}}}],
+                "goals": [{{{{"predicate": "on-table", "args": ["B"]}}}}, {{{{"predicate": "on", "args": ["G", "B"]}}}}, {{{{"predicate": "on", "args": ["P", "G"]}}}}],
+            }}}}
+        }}}}
+        Where
+        - objects are the objects present in the workspace
+        - init are the CURRENT state predicates
+        - goals are the desired FINAL state.
+
+        Requirements:
+        - Always return the JSON structure above (objects list, goals list). Lengths may vary.
+        - Object names CANNOT contain spaces, use underscore
+        - Colored blocks are represented by their color initial in lowercase: r=red, g=green, b=blue, y=yellow, p=purple
+        - Follow the instruction even if there are inconsistencies with the initial state (e.g. if the user says "place the red block on the table" but there is no red block in the initial state, you can still include "red_block" in the objects and goals as needed to fulfill the instruction)
+        - Do not wrap the JSON in Markdown fences.
+
+        Predicate hints:
+        - DO NOT create new predicates
+        - clear: args [object_name] — if the object has nothing on top of it (alone or top of a stack), you MUST include clear
+        - on-table: args [object_name] — the object is resting directly on the table surface
+        - arm-empty: args [] — the robot arm is not holding any object, this is ALWAYS true for the initial state
+        - holding: args [object_name] — the robot arm is currently grasping the specified object
+        - on: args [object_name, object_name] — the first object is stacked directly on top of the second object
+        """
+
+        return system_message
+
+    def _build_gripper_system_message(self, scene_desc: Optional[str], include_scene_desc: bool) -> str:
+        scene_section = ""
+        if include_scene_desc:
+            effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
+            scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
+
+        system_message = f"""You are a planning assistant for a robot manipulation system.
+
+        {scene_section}
+
+        Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
+        {{{{
+            "data": {{{{
+                "objects": ["roomA", "roomB", "Ball1", "Ball2", "left", "right"],
+                "init": [{{{{"predicate": "room", "args": ["roomA"]}}}}, {{{{"predicate": "room", "args": ["roomB"]}}}}, {{{{"predicate": "ball", "args": ["Ball1"]}}}}, {{{{"predicate": "ball", "args": ["Ball2"]}}}}, {{{{"predicate": "gripper", "args": ["left"]}}}}, {{{{"predicate": "gripper", "args": ["right"]}}}}, {{{{"predicate": "at-robby", "args": ["roomA"]}}}}, {{{{"predicate": "free", "args": ["left"]}}}}, {{{{"predicate": "free", "args": ["right"]}}}}, {{{{"predicate": "at", "args": ["Ball1", "roomA"]}}}}, {{{{"predicate": "at", "args": ["Ball2", "roomA"]}}}}],
+                "goals": [{{{{"predicate": "at", "args": ["Ball1", "roomB"]}}}}, {{{{"predicate": "at", "args": ["Ball2", "roomB"]}}}}]
+            }}}}
+        }}}}
+        Where
+        - objects are the ball, gripper, and room present in the problem
+        - init are the CURRENT state predicates
+        - goals are the desired FINAL state.
+
+        Requirements:
+        - Always return the JSON structure above (objects list, goals list). Lengths may vary.
+        - Object names CANNOT contain spaces, use underscore
+        - Do not wrap the JSON in Markdown fences.
+
+        Predicate hints:
+        - DO NOT create new predicates
+        - room: args [room_name] — declares that the argument is a room (type declaration)
+        - ball: args [ball_name] — declares that the argument is a ball (type declaration)
+        - gripper: args [gripper_name] — declares that the argument is a gripper (type declaration)
+        - at-robby: args [room_name] — the robot is currently located in the specified room
+        - at: args [ball_name, room_name] — the specified ball is currently located in the specified room
+        - free: args [gripper_name] — the specified gripper is not holding any object and is available to pick up
+        - carry: args [object_name, gripper_name] — the specified gripper is currently holding the specified object
+        """
+
+        return system_message
+
+    def _create_pddl_agent_executor(self, scene_desc: Optional[str] = None) -> AgentExecutor:
+        """Create an agent that generates planning data (objects and goals) in JSON format using structured output."""
+        if scene_desc is None:
+            with self._init_lock:
+                scene_desc = self.scene_description
+
+        system_message = self._build_system_message(scene_desc)
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_message),
@@ -959,7 +1217,7 @@ class Ros2HighLevelAgentNode(Node):
         prompt_text = goal_handle.request.prompt
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
 
-        feedback_msg = Prompt.Feedback()
+        feedback_msg = self.high_level_action_type.Feedback()
         result_container: Dict[str, Any] = {"success": False, "final_response": ""}
 
         def run_pipeline():
@@ -972,7 +1230,13 @@ class Ros2HighLevelAgentNode(Node):
 
                 self.get_logger().info(f"High-level Prompt action received: {goal_text}")
 
-                steps = self._generate_plan(goal_text, start_time=self.start_time)
+                request_scene_desc = getattr(goal_handle.request, "scene_desc", None)
+                self.get_logger().info(f"Scene description attached to request: {request_scene_desc}")
+                steps = self._generate_plan(
+                    goal_text,
+                    start_time=self.start_time,
+                    request_scene_desc=request_scene_desc,
+                )
                 if not steps:
                     result_container["success"] = False
                     result_container["final_response"] = "Failed to generate plan"
@@ -1007,7 +1271,7 @@ class Ros2HighLevelAgentNode(Node):
         except Exception:
             pass
 
-        result_msg = Prompt.Result()
+        result_msg = self.high_level_action_type.Result()
         result_msg.success = bool(result_container.get("success", False))
         result_msg.final_response = str(result_container.get("final_response", ""))
 
