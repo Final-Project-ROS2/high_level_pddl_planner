@@ -1099,9 +1099,9 @@ class Ros2HighLevelAgentNode(Node):
         Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
         {{{{
             "data": {{{{
-                "objects": ["B", "G", "P"],
-                "init": [{{{{"predicate": "arm-empty", "args": []}}}}, {{{{"predicate": "on-table", "args": ["B"]}}}}, {{{{"predicate": "on", "args": ["G", "B"]}}}}, {{{{"predicate": "on-table", "args": ["P"]}}}}],
-                "goals": [{{{{"predicate": "on-table", "args": ["B"]}}}}, {{{{"predicate": "on", "args": ["G", "B"]}}}}, {{{{"predicate": "on", "args": ["P", "G"]}}}}],
+                "objects": ["b", "g", "p"],
+                "init": [{{{{"predicate": "arm-empty", "args": []}}}}, {{{{"predicate": "on-table", "args": ["b"]}}}}, {{{{"predicate": "on", "args": ["g", "b"]}}}}, {{{{"predicate": "on-table", "args": ["p"]}}}}],
+                "goals": [{{{{"predicate": "on-table", "args": ["b"]}}}}, {{{{"predicate": "on", "args": ["g", "b"]}}}}, {{{{"predicate": "on", "args": ["p", "g"]}}}}],
             }}}}
         }}}}
         Where
@@ -1110,7 +1110,7 @@ class Ros2HighLevelAgentNode(Node):
         - goals are the desired FINAL state.
 
         Requirements:
-        - Always return the JSON structure above (objects list, goals list). Lengths may vary.
+        - ALWAYS return the JSON structure above following the schema (objects list, goals list) EXACTLY. Lengths may vary.
         - Object names CANNOT contain spaces, use underscore
         - Colored blocks are represented by their color initial in lowercase: r=red, g=green, b=blue, y=yellow, p=purple
         - Follow the instruction even if there are inconsistencies with the initial state (e.g. if the user says "place the red block on the table" but there is no red block in the initial state, you can still include "red_block" in the objects and goals as needed to fulfill the instruction)
