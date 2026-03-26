@@ -33,15 +33,62 @@ from custom_interfaces.srv import (
     GetSetBool,
 )
 
+from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool, tool
-from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain.agents import AgentExecutor, create_agent
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_ollama import ChatOllama
 
 
 from dotenv import load_dotenv
+
+
+# ==================== Structured Output Models ====================
+class Predicate(BaseModel):
+    """Represents a single PDDL predicate with arguments."""
+    predicate: str = Field(description="Name of the predicate")
+    args: List[str] = Field(default_factory=list, description="Arguments to the predicate")
+
+
+class DefaultDomainOutput(BaseModel):
+    """Structured output for the default domain."""
+    locations: List[str] = Field(default_factory=list, description="Task-specific locations needed")
+    objects: List[str] = Field(default_factory=list, description="Objects present in the workspace")
+    goals: List[Predicate] = Field(default_factory=list, description="Desired final state predicates")
+
+
+class DefaultDomainData(BaseModel):
+    """Wrapper for default domain output."""
+    data: DefaultDomainOutput
+
+
+class BlocksworldDomainOutput(BaseModel):
+    """Structured output for the blocksworld domain."""
+    objects: List[str] = Field(description="Objects (blocks) present in the workspace")
+    init: List[Predicate] = Field(default_factory=list, description="Current state predicates")
+    goals: List[Predicate] = Field(description="Desired final state predicates")
+
+
+class BlocksworldDomainData(BaseModel):
+    """Wrapper for blocksworld domain output."""
+    data: BlocksworldDomainOutput
+
+
+class GripperDomainOutput(BaseModel):
+    """Structured output for the gripper domain."""
+    objects: List[str] = Field(description="Objects (rooms, balls, grippers)")
+    init: List[Predicate] = Field(default_factory=list, description="Current state predicates")
+    goals: List[Predicate] = Field(description="Desired final state predicates")
+
+
+class GripperDomainData(BaseModel):
+    """Wrapper for gripper domain output."""
+    data: GripperDomainOutput
+
+
+# ===================================================================
 
 PROJECT_ROOT = Path("/home/group11/final_project_ws/src/high_level_pddl_planner")
 
@@ -543,29 +590,49 @@ class Ros2HighLevelAgentNode(Node):
                 "chat_history": langchain_history
             })
 
-            final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
-            self.get_logger().info(f"Agent output (raw):\n{final_text}")
+            # Extract structured response from agent state
+            # According to Langchain docs, structured response is in 'structured_response' key
+            agent_output = agent_resp.get("structured_response")
+            
+            if agent_output is None:
+                # Fallback: check for direct output key
+                agent_output = agent_resp.get("output")
+            
+            self.get_logger().info(f"Agent output (raw): {agent_output}")
 
-            # If the agent is asking a clarifying question (prefixed with NORMAL), just relay it
-            final_text_stripped = final_text.strip()
-            if final_text_stripped.upper().startswith("NORMAL"):
-                clarification = final_text_stripped[len("NORMAL"):].lstrip(" :")
-                clarification = clarification or final_text_stripped
-                self.get_logger().info(f"Agent requests clarification: {clarification}")
-                self.chat_history.append({"role": "assistant", "content": clarification})
-                self.response_pub.publish(String(data=clarification))
-                self.tts_pub.publish(String(data=self._format_for_tts(clarification)))
-                return []
-
-            self.chat_history.append({"role": "assistant", "content": final_text})
+            # Check if this is a clarifying question (string response)
+            if isinstance(agent_output, str):
+                final_text_stripped = agent_output.strip()
+                if final_text_stripped.upper().startswith("NORMAL"):
+                    clarification = final_text_stripped[len("NORMAL"):].lstrip(" :")
+                    clarification = clarification or final_text_stripped
+                    self.get_logger().info(f"Agent requests clarification: {clarification}")
+                    self.chat_history.append({"role": "assistant", "content": clarification})
+                    self.response_pub.publish(String(data=clarification))
+                    self.tts_pub.publish(String(data=self._format_for_tts(clarification)))
+                    return []
+                # If it's a string but not a clarification, treat as fallback JSON
+                final_text = final_text_stripped
+                self.chat_history.append({"role": "assistant", "content": final_text})
+            else:
+                # Structured output - convert Pydantic model to JSON for logging
+                final_text = json.dumps(agent_output.model_dump() if hasattr(agent_output, 'model_dump') else agent_output.dict(), indent=2)
+                self.chat_history.append({"role": "assistant", "content": final_text})
 
             self.response_pub.publish(String(data="Generating planning data and PDDL problem file"))
             self.tts_pub.publish(String(data="Generating planning data."))
 
-            planning_payload = self._parse_planning_json(final_text)
+            # Parse the planning data - handle both structured output and fallback JSON string parsing
+            if isinstance(agent_output, str):
+                # Fallback: parse as JSON string
+                planning_payload = self._parse_planning_json(final_text)
+            else:
+                # Structured output: convert Pydantic model directly
+                planning_payload = self._structured_output_to_dict(agent_output)
+
             if not planning_payload:
                 msg = "Hmm... I couldn't generate valid planning data. Could you try rephrasing that?"
-                self.get_logger().error("LLM response could not be parsed into planning JSON.")
+                self.get_logger().error("LLM response could not be parsed into planning data.")
                 self.response_pub.publish(String(data=msg))
                 self.tts_pub.publish(String(data=self._format_for_tts(msg)))
                 return []
@@ -855,6 +922,87 @@ class Ros2HighLevelAgentNode(Node):
                 lines.append(ln)
         return lines
 
+    def _structured_output_to_dict(self, output: Any) -> Optional[Dict[str, Any]]:
+        """Convert structured output (Pydantic model) to internal dictionary format."""
+        try:
+            if hasattr(output, "model_dump"):
+                # Pydantic v2
+                output_dict = output.model_dump()
+            elif hasattr(output, "dict"):
+                # Pydantic v1
+                output_dict = output.dict()
+            else:
+                return None
+
+            # Navigate to the data object
+            if "data" in output_dict:
+                base_data = output_dict["data"]
+            else:
+                base_data = output_dict
+
+            if not isinstance(base_data, dict):
+                self.get_logger().error("Structured output 'data' field is not a dict")
+                return None
+
+            # Extract and validate fields
+            locations = base_data.get("locations", [])
+            objects = base_data.get("objects", [])
+            goals = base_data.get("goals", [])
+            init = base_data.get("init", [])
+
+            if not isinstance(objects, list) or not isinstance(goals, list):
+                self.get_logger().error("Structured output objects/goals are not lists")
+                return None
+
+            if locations is not None and not isinstance(locations, list):
+                locations = []
+
+            if init is not None and not isinstance(init, list):
+                init = []
+
+            # Convert predicates to standardized format
+            sanitized_goals: List[Dict[str, Any]] = []
+            for goal in goals:
+                if isinstance(goal, dict):
+                    sanitized_goals.append({
+                        "predicate": str(goal.get("predicate", "")).strip(),
+                        "args": [str(arg).strip() for arg in goal.get("args", [])]
+                    })
+                elif hasattr(goal, "predicate"):
+                    # Pydantic model
+                    sanitized_goals.append({
+                        "predicate": str(goal.predicate).strip(),
+                        "args": [str(arg).strip() for arg in getattr(goal, "args", [])]
+                    })
+
+            sanitized_init: List[Dict[str, Any]] = []
+            for init_pred in init or []:
+                if isinstance(init_pred, dict):
+                    sanitized_init.append({
+                        "predicate": str(init_pred.get("predicate", "")).strip(),
+                        "args": [str(arg).strip() for arg in init_pred.get("args", [])]
+                    })
+                elif hasattr(init_pred, "predicate"):
+                    # Pydantic model
+                    sanitized_init.append({
+                        "predicate": str(init_pred.predicate).strip(),
+                        "args": [str(arg).strip() for arg in getattr(init_pred, "args", [])]
+                    })
+
+            sanitized_locations = [str(loc).strip() for loc in locations if str(loc).strip()]
+            sanitized_objects = [str(obj).strip() for obj in objects if str(obj).strip()]
+
+            return {
+                "locations": sanitized_locations,
+                "objects": sanitized_objects,
+                "goals": sanitized_goals,
+                "init": sanitized_init,
+            }
+
+        except Exception as e:
+            self.get_logger().error(f"Error converting structured output: {e}")
+            return None
+
     def _parse_planning_json(self, text: str) -> Optional[Dict[str, Any]]:
         """Parse LLM output into planning data dict following data.json structure."""
         if not text:
@@ -1049,31 +1197,22 @@ class Ros2HighLevelAgentNode(Node):
 
         {scene_section}
 
-        Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
-        {{{{
-            "data": {{{{
-                "locations": ["left-of-gear"],
-                "objects": ["gear", "bolt"],
-                "goals": [{{{{"predicate": "gripper-close", "args": []}}}}]
-            }}}}
-        }}}}
-        Where
-        - locations are task-specific locations needed to complete the instruction.
-        - objects are the objects present in the workspace
-        - goals are the desired FINAL state.
-        DO NOT put intermediate goals in the goals list.
-        - If the user ask to "handover" or "hand me" an object, the requested object should be located at handover
+        Your job: analyze the user's instruction and determine the planning data needed to achieve the goal.
 
-        Requirements:
-        - Always return the JSON structure above (objects list, goals list). Lengths may vary.
-        - Object names CANNOT contain spaces, use underscore
-        - Do not wrap the JSON in Markdown fences.
-        - You can add modifiers to the object name, like screwdriver_leftmost, so you DO NOT need to ask clarifying questions
-        - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
-        - You may call tools like vqa if needed, but the final reply must still be the JSON described.
+        Analyze the instruction to extract:
+        - locations: task-specific locations needed to complete the instruction
+        - objects: the objects present in the workspace
+        - goals: the desired FINAL state (do not include intermediate goals)
 
-        Predicate hints:
-        - DO NOT create new predicates
+        If the user asks to "handover" or "hand me" an object, the requested object should be located at handover.
+
+        Important guidelines:
+        - Object names CANNOT contain spaces, use underscores instead
+        - You can add modifiers to object names, like screwdriver_leftmost, so you should NOT ask clarifying questions
+        - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL
+        - You may call tools like vqa if needed, but the final reply must provide the structured output described above
+
+        Available predicates (DO NOT create new ones):
         - gripper-open: args []
         - gripper-close: args []
         - robot-at-location: args [location_name]
@@ -1092,37 +1231,27 @@ class Ros2HighLevelAgentNode(Node):
             effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
             scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
 
-        system_message = f"""You are a planning assistant for a robot manipulation system.
+        system_message = f"""You are a planning assistant for a blocksworld system.
 
         {scene_section}
 
-        Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
-        {{{{
-            "data": {{{{
-                "objects": ["b", "g", "p"],
-                "init": [{{{{"predicate": "arm-empty", "args": []}}}}, {{{{"predicate": "on-table", "args": ["b"]}}}}, {{{{"predicate": "on", "args": ["g", "b"]}}}}, {{{{"predicate": "on-table", "args": ["p"]}}}}],
-                "goals": [{{{{"predicate": "on-table", "args": ["b"]}}}}, {{{{"predicate": "on", "args": ["g", "b"]}}}}, {{{{"predicate": "on", "args": ["p", "g"]}}}}],
-            }}}}
-        }}}}
-        Where
-        - objects are the objects present in the workspace
-        - init are the CURRENT state predicates
-        - goals are the desired FINAL state.
+        Your job: analyze the user's instruction and determine the planning data needed.
 
-        Requirements:
-        - ALWAYS return the JSON structure above following the schema (objects list, goals list) EXACTLY. Lengths may vary.
-        - Object names CANNOT contain spaces, use underscore
-        - Colored blocks are represented by their color initial in lowercase: r=red, g=green, b=blue, y=yellow, p=purple
-        - Follow the instruction even if there are inconsistencies with the initial state (e.g. if the user says "place the red block on the table" but there is no red block in the initial state, you can still include "red_block" in the objects and goals as needed to fulfill the instruction)
-        - Do not wrap the JSON in Markdown fences.
+        Extract:
+        - objects: the blocks present in the workspace (use color initials: r=red, g=green, b=blue, y=yellow, p=purple)
+        - init: the CURRENT state predicates
+        - goals: the desired FINAL state predicates
 
-        Predicate hints:
-        - DO NOT create new predicates
-        - clear: args [object_name] — if the object has nothing on top of it (alone or top of a stack), you MUST include clear
-        - on-table: args [object_name] — the object is resting directly on the table surface
-        - arm-empty: args [] — the robot arm is not holding any object, this is ALWAYS true for the initial state
-        - holding: args [object_name] — the robot arm is currently grasping the specified object
-        - on: args [object_name, object_name] — the first object is stacked directly on top of the second object
+        Important guidelines:
+        - Follow the instruction even if there are inconsistencies with the initial state
+        - You can infer objects from the instruction if not explicitly mentioned in the initial state
+
+        Available predicates (DO NOT create new ones):
+        - clear: args [object_name] — the object is clear (nothing on top)
+        - on-table: args [object_name] — the object is on the table surface
+        - arm-empty: args [] — the robot arm is not holding any object
+        - holding: args [object_name] — the robot arm is holding the object
+        - on: args [object_name, object_name] — first object is on top of second
         """
 
         return system_message
@@ -1133,48 +1262,48 @@ class Ros2HighLevelAgentNode(Node):
             effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
             scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
 
-        system_message = f"""You are a planning assistant for a robot manipulation system.
+        system_message = f"""You are a planning assistant for a gripper robot system.
 
         {scene_section}
 
-        Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
-        {{{{
-            "data": {{{{
-                "objects": ["roomA", "roomB", "Ball1", "Ball2", "left", "right"],
-                "init": [{{{{"predicate": "room", "args": ["roomA"]}}}}, {{{{"predicate": "room", "args": ["roomB"]}}}}, {{{{"predicate": "ball", "args": ["Ball1"]}}}}, {{{{"predicate": "ball", "args": ["Ball2"]}}}}, {{{{"predicate": "gripper", "args": ["left"]}}}}, {{{{"predicate": "gripper", "args": ["right"]}}}}, {{{{"predicate": "at-robby", "args": ["roomA"]}}}}, {{{{"predicate": "free", "args": ["left"]}}}}, {{{{"predicate": "free", "args": ["right"]}}}}, {{{{"predicate": "at", "args": ["Ball1", "roomA"]}}}}, {{{{"predicate": "at", "args": ["Ball2", "roomA"]}}}}],
-                "goals": [{{{{"predicate": "at", "args": ["Ball1", "roomB"]}}}}, {{{{"predicate": "at", "args": ["Ball2", "roomB"]}}}}]
-            }}}}
-        }}}}
-        Where
-        - objects are the ball, gripper, and room present in the problem
-        - init are the CURRENT state predicates
-        - goals are the desired FINAL state.
+        Your job: analyze the user's instruction and determine the planning data needed.
 
-        Requirements:
-        - Always return the JSON structure above (objects list, goals list). Lengths may vary.
-        - Object names CANNOT contain spaces, use underscore
-        - Do not wrap the JSON in Markdown fences.
+        Extract:
+        - objects: the rooms, balls, and grippers involved
+        - init: the CURRENT state predicates
+        - goals: the desired FINAL state predicates
 
-        Predicate hints:
-        - DO NOT create new predicates
-        - room: args [room_name] — declares that the argument is a room (type declaration)
-        - ball: args [ball_name] — declares that the argument is a ball (type declaration)
-        - gripper: args [gripper_name] — declares that the argument is a gripper (type declaration)
-        - at-robby: args [room_name] — the robot is currently located in the specified room
-        - at: args [ball_name, room_name] — the specified ball is currently located in the specified room
-        - free: args [gripper_name] — the specified gripper is not holding any object and is available to pick up
-        - carry: args [object_name, gripper_name] — the specified gripper is currently holding the specified object
+        Important guidelines:
+        - Object names CANNOT contain spaces, use underscores
+        - Identify all necessary rooms, balls, and grippers from the instruction
+
+        Available predicates (DO NOT create new ones):
+        - room: args [room_name] — type declaration for rooms
+        - ball: args [ball_name] — type declaration for balls
+        - gripper: args [gripper_name] — type declaration for grippers
+        - at-robby: args [room_name] — the robot is in the specified room
+        - at: args [ball_name, room_name] — the ball is in the specified room
+        - free: args [gripper_name] — the gripper is not holding anything
+        - carry: args [object_name, gripper_name] — the gripper is holding the object
         """
 
         return system_message
 
     def _create_pddl_agent_executor(self, scene_desc: Optional[str] = None) -> AgentExecutor:
-        """Create an agent that generates planning data (objects and goals) in JSON format using structured output."""
+        """Create an agent that generates planning data using structured output."""
         if scene_desc is None:
             with self._init_lock:
                 scene_desc = self.scene_description
 
         system_message = self._build_system_message(scene_desc)
+
+        # Select the appropriate output schema based on domain mode
+        if self.domain_mode == "blocksworld":
+            output_schema = BlocksworldDomainData
+        elif self.domain_mode == "gripper":
+            output_schema = GripperDomainData
+        else:
+            output_schema = DefaultDomainData
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_message),
@@ -1183,10 +1312,12 @@ class Ros2HighLevelAgentNode(Node):
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
         
-        agent = create_tool_calling_agent(
+        # Use response_format parameter for structured output
+        agent = create_agent(
             llm=self.llm,
             tools=self.tools,
             prompt=prompt,
+            response_format=output_schema,
         )
 
         return AgentExecutor(agent=agent, tools=self.tools, verbose=True, max_iterations=12)
