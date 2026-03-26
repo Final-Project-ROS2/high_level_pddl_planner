@@ -860,6 +860,42 @@ class Ros2HighLevelAgentNode(Node):
         if not text:
             return None
 
+        def _parse_predicate_text_list(items: Any, field_name: str) -> Optional[List[Dict[str, Any]]]:
+            if items is None:
+                return []
+            if not isinstance(items, list):
+                self.get_logger().error(f"JSON field '{field_name}' must be a list when provided")
+                return None
+
+            parsed_items: List[Dict[str, Any]] = []
+            for item in items:
+                # Preferred format: "predicate arg1 arg2"
+                if isinstance(item, str):
+                    raw = " ".join(item.split())
+                    if not raw:
+                        continue
+                    parts = raw.split(" ")
+                    parsed_items.append({
+                        "predicate": parts[0],
+                        "args": parts[1:],
+                    })
+                    continue
+
+                # Backward compatibility: {"predicate": "...", "args": [...]}
+                if isinstance(item, dict):
+                    predicate = item.get("predicate")
+                    args = item.get("args", [])
+                    if predicate is None or not isinstance(args, list):
+                        continue
+                    pred_name = str(predicate).strip()
+                    if not pred_name:
+                        continue
+                    parsed_items.append({
+                        "predicate": pred_name,
+                        "args": [str(arg).strip() for arg in args if str(arg).strip()]
+                    })
+            return parsed_items
+
         def _try_load(candidate: str) -> Optional[Dict[str, Any]]:
             try:
                 return json.loads(candidate)
@@ -908,38 +944,16 @@ class Ros2HighLevelAgentNode(Node):
             self.get_logger().error("JSON does not contain list fields for objects/goals/locations")
             return None
 
-        if init is not None and not isinstance(init, list):
-            self.get_logger().error("JSON field 'init' must be a list when provided")
-            return None
-
         sanitized_locations = [str(loc).strip() for loc in locations if str(loc).strip()]
         sanitized_objects = [str(obj).strip() for obj in objects if str(obj).strip()]
 
-        sanitized_goals: List[Dict[str, Any]] = []
-        for goal in goals:
-            if not isinstance(goal, dict):
-                continue
-            predicate = goal.get("predicate")
-            args = goal.get("args", [])
-            if predicate is None or not isinstance(args, list):
-                continue
-            sanitized_goals.append({
-                "predicate": str(predicate).strip(),
-                "args": [str(arg).strip() for arg in args]
-            })
+        sanitized_goals = _parse_predicate_text_list(goals, "goals")
+        if sanitized_goals is None:
+            return None
 
-        sanitized_init: List[Dict[str, Any]] = []
-        for init_predicate in init or []:
-            if not isinstance(init_predicate, dict):
-                continue
-            predicate = init_predicate.get("predicate")
-            args = init_predicate.get("args", [])
-            if predicate is None or not isinstance(args, list):
-                continue
-            sanitized_init.append({
-                "predicate": str(predicate).strip(),
-                "args": [str(arg).strip() for arg in args]
-            })
+        sanitized_init = _parse_predicate_text_list(init, "init")
+        if sanitized_init is None:
+            return None
 
         if not sanitized_objects and not sanitized_goals and not sanitized_locations:
             self.get_logger().error("Parsed JSON missing objects, goals, and locations")
@@ -1054,13 +1068,14 @@ class Ros2HighLevelAgentNode(Node):
             "data": {{{{
                 "locations": ["left-of-gear"],
                 "objects": ["gear", "bolt"],
-                "goals": [{{{{"predicate": "gripper-close", "args": []}}}}]
+                "goals": ["gripper-close"]
             }}}}
         }}}}
         Where
         - locations are task-specific locations needed to complete the instruction.
         - objects are the objects present in the workspace
         - goals are the desired FINAL state.
+        - Each predicate in goals/init must be a single string with space-separated tokens, e.g. "object-at-location gear handover"
         DO NOT put intermediate goals in the goals list.
         - If the user ask to "handover" or "hand me" an object, the requested object should be located at handover
 
@@ -1100,14 +1115,15 @@ class Ros2HighLevelAgentNode(Node):
         {{{{
             "data": {{{{
                 "objects": ["b", "g", "p"],
-                "init": [{{{{"predicate": "arm-empty", "args": []}}}}, {{{{"predicate": "on-table", "args": ["b"]}}}}, {{{{"predicate": "on", "args": ["g", "b"]}}}}, {{{{"predicate": "on-table", "args": ["p"]}}}}],
-                "goals": [{{{{"predicate": "on-table", "args": ["b"]}}}}, {{{{"predicate": "on", "args": ["g", "b"]}}}}, {{{{"predicate": "on", "args": ["p", "g"]}}}}],
+                "init": ["arm-empty", "on-table b", "on g b", "on-table p"],
+                "goals": ["on-table b", "on g b", "on p g"],
             }}}}
         }}}}
         Where
         - objects are the objects present in the workspace
         - init are the CURRENT state predicates
         - goals are the desired FINAL state.
+        - Each predicate in goals/init must be a single string with space-separated tokens, e.g. "on p g"
 
         Requirements:
         - ALWAYS return the JSON structure above following the schema (objects list, goals list) EXACTLY. Lengths may vary.
@@ -1141,14 +1157,15 @@ class Ros2HighLevelAgentNode(Node):
         {{{{
             "data": {{{{
                 "objects": ["roomA", "roomB", "Ball1", "Ball2", "left", "right"],
-                "init": [{{{{"predicate": "room", "args": ["roomA"]}}}}, {{{{"predicate": "room", "args": ["roomB"]}}}}, {{{{"predicate": "ball", "args": ["Ball1"]}}}}, {{{{"predicate": "ball", "args": ["Ball2"]}}}}, {{{{"predicate": "gripper", "args": ["left"]}}}}, {{{{"predicate": "gripper", "args": ["right"]}}}}, {{{{"predicate": "at-robby", "args": ["roomA"]}}}}, {{{{"predicate": "free", "args": ["left"]}}}}, {{{{"predicate": "free", "args": ["right"]}}}}, {{{{"predicate": "at", "args": ["Ball1", "roomA"]}}}}, {{{{"predicate": "at", "args": ["Ball2", "roomA"]}}}}],
-                "goals": [{{{{"predicate": "at", "args": ["Ball1", "roomB"]}}}}, {{{{"predicate": "at", "args": ["Ball2", "roomB"]}}}}]
+                "init": ["room roomA", "room roomB", "ball Ball1", "ball Ball2", "gripper left", "gripper right", "at-robby roomA", "free left", "free right", "at Ball1 roomA", "at Ball2 roomA"],
+                "goals": ["at Ball1 roomB", "at Ball2 roomB"]
             }}}}
         }}}}
         Where
         - objects are the ball, gripper, and room present in the problem
         - init are the CURRENT state predicates
         - goals are the desired FINAL state.
+        - Each predicate in goals/init must be a single string with space-separated tokens, e.g. "at Ball1 roomB"
 
         Requirements:
         - Always return the JSON structure above (objects list, goals list). Lengths may vary.
