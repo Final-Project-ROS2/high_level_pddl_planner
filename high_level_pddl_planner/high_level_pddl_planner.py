@@ -471,6 +471,9 @@ class Ros2HighLevelAgentNode(Node):
         request_scene_desc: Optional[str] = None,
     ) -> List[str]:
         """Generate a plan using fixed domain and dynamic problem generation."""
+        # Make blocksworld/gripper runs stateless by dropping any prior turns
+        if self.domain_mode != "default":
+            self.chat_history.clear()
         self.chat_history.append({"role": "user", "content": instruction_text})
 
         with self._tools_called_lock:
