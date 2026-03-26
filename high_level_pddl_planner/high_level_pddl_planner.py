@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import BaseTool, tool
 from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
 from langchain_ollama import ChatOllama
 
 
@@ -1300,12 +1301,16 @@ class Ros2HighLevelAgentNode(Node):
         else:
             output_schema = DefaultDomainData
 
+        # Use ToolStrategy for Ollama (tool-calling structured output). Some Ollama
+        # client versions do not support provider-native response_format arguments.
+        response_format = ToolStrategy(output_schema) if self.use_ollama else output_schema
+
         # Use response_format parameter for structured output
         agent = create_agent(
             model=self.llm,
             tools=self.tools,
             system_prompt=system_message,
-            response_format=output_schema,
+            response_format=response_format,
         )
 
         return agent
