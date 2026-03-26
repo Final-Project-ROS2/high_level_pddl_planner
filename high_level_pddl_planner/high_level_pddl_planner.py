@@ -37,8 +37,9 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool, tool
 from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_ollama import ChatOllama
+from pydantic import BaseModel, Field
 
 
 from dotenv import load_dotenv
@@ -69,6 +70,26 @@ DOMAIN_PDDL_GRIPPER = os.getenv("DOMAIN_PDDL_GRIPPER", str(PROJECT_ROOT / "domai
 
 SCENE_DESC_MODES = {"default", "custom", "disabled"}
 DOMAIN_MODES = {"default", "blocksworld", "gripper"}
+
+
+class PlanningPredicate(BaseModel):
+    predicate: str = Field(description="Predicate name")
+    args: List[str] = Field(default_factory=list, description="Predicate arguments")
+
+
+class PlanningStructuredOutput(BaseModel):
+    needs_clarification: bool = Field(
+        default=False,
+        description="True when user instruction is unclear and needs clarification.",
+    )
+    clarifying_question: str = Field(
+        default="",
+        description="Question to ask user when needs_clarification is true.",
+    )
+    locations: List[str] = Field(default_factory=list)
+    objects: List[str] = Field(default_factory=list)
+    goals: List[PlanningPredicate] = Field(default_factory=list)
+    init: List[PlanningPredicate] = Field(default_factory=list)
 
 class PDDLGenerationResult:
     def __init__(self, json_data: Dict[str, Any]):
@@ -136,6 +157,8 @@ class Ros2HighLevelAgentNode(Node):
                 google_api_key=api_key,
                 temperature=0.0,
             )
+
+            self.structured_planner = self._create_structured_planner()
 
         # Transcript subscription
         self.transcript_sub = self.create_subscription(String, "/transcript", self.transcript_callback, 10)
@@ -503,7 +526,7 @@ class Ros2HighLevelAgentNode(Node):
                     current_scene = self.scene_description
                 self.agent_executor = self._create_pddl_agent_executor(scene_desc=current_scene)
 
-            if self.agent_executor is None:
+            if self.agent_executor is None and self.structured_planner is None:
                 raise RuntimeError("Agent executor is not initialized")
 
             init_predicates: List[Dict[str, Any]] = []
@@ -537,32 +560,62 @@ class Ros2HighLevelAgentNode(Node):
                 elif msg["role"] == "assistant":
                     langchain_history.append(AIMessage(content=msg["content"]))
 
-            # Invoke agent with instruction only (state will be in init block)
-            agent_resp = self.agent_executor.invoke({
-                "input": instruction_text,
-                "chat_history": langchain_history
-            })
+            planning_payload: Optional[Dict[str, Any]] = None
+            final_text = ""
 
-            final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
-            self.get_logger().info(f"Agent output (raw):\n{final_text}")
+            if self.structured_planner is not None:
+                structured_output = self._invoke_structured_planner(instruction_text, langchain_history)
+                if structured_output is None:
+                    msg = "Hmm... I couldn't generate valid planning data. Could you try rephrasing that?"
+                    self.get_logger().error("Structured output generation failed.")
+                    self.response_pub.publish(String(data=msg))
+                    self.tts_pub.publish(String(data=self._format_for_tts(msg)))
+                    return []
 
-            # If the agent is asking a clarifying question (prefixed with NORMAL), just relay it
-            final_text_stripped = final_text.strip()
-            if final_text_stripped.upper().startswith("NORMAL"):
-                clarification = final_text_stripped[len("NORMAL"):].lstrip(" :")
-                clarification = clarification or final_text_stripped
-                self.get_logger().info(f"Agent requests clarification: {clarification}")
-                self.chat_history.append({"role": "assistant", "content": clarification})
-                self.response_pub.publish(String(data=clarification))
-                self.tts_pub.publish(String(data=self._format_for_tts(clarification)))
-                return []
+                if structured_output.needs_clarification:
+                    clarification = (structured_output.clarifying_question or "Could you clarify your request?").strip()
+                    self.get_logger().info(f"Structured planner requests clarification: {clarification}")
+                    self.chat_history.append({"role": "assistant", "content": clarification})
+                    self.response_pub.publish(String(data=clarification))
+                    self.tts_pub.publish(String(data=self._format_for_tts(clarification)))
+                    return []
+
+                planning_payload = self._sanitize_planning_payload({
+                    "locations": structured_output.locations,
+                    "objects": structured_output.objects,
+                    "goals": [g.model_dump() for g in structured_output.goals],
+                    "init": [p.model_dump() for p in structured_output.init],
+                })
+                final_text = json.dumps({"data": planning_payload or {}}, indent=2)
+                self.get_logger().info(f"Structured planner output:\n{final_text}")
+            else:
+                # Fallback: invoke tool-calling agent and parse JSON text output.
+                agent_resp = self.agent_executor.invoke({
+                    "input": instruction_text,
+                    "chat_history": langchain_history
+                })
+
+                final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
+                self.get_logger().info(f"Agent output (raw):\n{final_text}")
+
+                # If the agent is asking a clarifying question (prefixed with NORMAL), just relay it
+                final_text_stripped = final_text.strip()
+                if final_text_stripped.upper().startswith("NORMAL"):
+                    clarification = final_text_stripped[len("NORMAL"):].lstrip(" :")
+                    clarification = clarification or final_text_stripped
+                    self.get_logger().info(f"Agent requests clarification: {clarification}")
+                    self.chat_history.append({"role": "assistant", "content": clarification})
+                    self.response_pub.publish(String(data=clarification))
+                    self.tts_pub.publish(String(data=self._format_for_tts(clarification)))
+                    return []
+
+                planning_payload = self._parse_planning_json(final_text)
 
             self.chat_history.append({"role": "assistant", "content": final_text})
 
             self.response_pub.publish(String(data="Generating planning data and PDDL problem file"))
             self.tts_pub.publish(String(data="Generating planning data."))
 
-            planning_payload = self._parse_planning_json(final_text)
             if not planning_payload:
                 msg = "Hmm... I couldn't generate valid planning data. Could you try rephrasing that?"
                 self.get_logger().error("LLM response could not be parsed into planning JSON.")
@@ -897,19 +950,21 @@ class Ros2HighLevelAgentNode(Node):
         if not isinstance(base_data, dict):
             self.get_logger().error("Parsed JSON missing 'data' object")
             return None
-        
+
+        return self._sanitize_planning_payload(base_data)
+
+    def _sanitize_planning_payload(self, base_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         locations = base_data.get("locations", [])
         objects = base_data.get("objects", [])
         goals = base_data.get("goals", [])
         init = base_data.get("init", [])
 
-    
         if not isinstance(objects, list) or not isinstance(goals, list) or not isinstance(locations, list):
-            self.get_logger().error("JSON does not contain list fields for objects/goals/locations")
+            self.get_logger().error("Planning payload does not contain list fields for objects/goals/locations")
             return None
 
         if init is not None and not isinstance(init, list):
-            self.get_logger().error("JSON field 'init' must be a list when provided")
+            self.get_logger().error("Planning payload field 'init' must be a list when provided")
             return None
 
         sanitized_locations = [str(loc).strip() for loc in locations if str(loc).strip()]
@@ -942,7 +997,7 @@ class Ros2HighLevelAgentNode(Node):
             })
 
         if not sanitized_objects and not sanitized_goals and not sanitized_locations:
-            self.get_logger().error("Parsed JSON missing objects, goals, and locations")
+            self.get_logger().error("Parsed planning payload missing objects, goals, and locations")
             return None
 
         return {
@@ -1030,6 +1085,94 @@ class Ros2HighLevelAgentNode(Node):
     # -----------------------
     # Create Planning Agent
     # -----------------------
+    def _create_structured_planner(self):
+        if not self.use_ollama:
+            return None
+        if not isinstance(self.llm, ChatOllama):
+            self.get_logger().warn("Structured planner is only configured for ChatOllama.")
+            return None
+        try:
+            return self.llm.with_structured_output(
+                PlanningStructuredOutput,
+                method="json_schema",
+                include_raw=False,
+            )
+        except Exception as e:
+            self.get_logger().error(f"Failed to initialize Ollama structured planner: {e}")
+            return None
+
+    def _build_structured_system_message(self, scene_desc: Optional[str]) -> str:
+        include_scene_desc = self.scene_desc_mode != "disabled"
+        scene_section = ""
+        if include_scene_desc:
+            effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
+            scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
+
+        if self.domain_mode == "blocksworld":
+            return f"""You are a planning assistant for a robot manipulation system.
+
+            {scene_section}
+
+            Fill the structured output fields for a blocks world planning task.
+            - Set needs_clarification=true and provide clarifying_question if the request is too ambiguous.
+            - Otherwise set needs_clarification=false and provide objects, init, and goals.
+            - Colored blocks are represented by lowercase initials: r, g, b, y, p.
+            - Do not invent predicate names. Allowed predicates: clear, on-table, arm-empty, holding, on.
+            - Include clear predicates for any block that has nothing on top.
+            """
+
+        if self.domain_mode == "gripper":
+            return f"""You are a planning assistant for a robot manipulation system.
+
+            {scene_section}
+
+            Fill the structured output fields for a gripper planning task.
+            - Set needs_clarification=true and provide clarifying_question if the request is too ambiguous.
+            - Otherwise set needs_clarification=false and provide objects, init, and goals.
+            - Do not invent predicate names. Allowed predicates: room, ball, gripper, at-robby, at, free, carry.
+            """
+
+        return f"""You are a planning assistant for a robot manipulation system.
+
+        {scene_section}
+
+        Fill the structured output fields for manipulation planning.
+        - Set needs_clarification=true and provide clarifying_question if the request is too ambiguous.
+        - Otherwise set needs_clarification=false and provide locations, objects, and goals.
+        - Do not invent predicate names.
+        - Allowed predicates: gripper-open, gripper-close, robot-at-location, robot-at-object, object-at-location, robot-have.
+        - Available locations: home, ready, handover.
+        - If user asks to hand over an object, target its final location as handover.
+        - Object names must not contain spaces; use underscores.
+        """
+
+    def _invoke_structured_planner(
+        self,
+        instruction_text: str,
+        langchain_history: List[Any],
+    ) -> Optional[PlanningStructuredOutput]:
+        if self.structured_planner is None:
+            return None
+
+        with self._init_lock:
+            scene_desc = self.scene_description
+
+        system_message = self._build_structured_system_message(scene_desc)
+        messages = [SystemMessage(content=system_message)]
+        messages.extend(langchain_history)
+        messages.append(HumanMessage(content=instruction_text))
+
+        try:
+            result = self.structured_planner.invoke(messages)
+            if isinstance(result, PlanningStructuredOutput):
+                return result
+            if isinstance(result, dict):
+                return PlanningStructuredOutput.model_validate(result)
+            return PlanningStructuredOutput.model_validate(result)
+        except Exception as e:
+            self.get_logger().error(f"Structured planner invoke failed: {e}")
+            return None
+
     def _build_system_message(self, scene_desc: Optional[str]) -> str:
         include_scene_desc = self.scene_desc_mode != "disabled"
 
