@@ -35,10 +35,8 @@ from custom_interfaces.srv import (
 
 from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool, tool
-from langchain.agents import AgentExecutor, create_agent
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain.agents import create_agent
 from langchain_ollama import ChatOllama
 
 
@@ -205,7 +203,7 @@ class Ros2HighLevelAgentNode(Node):
         self._tools_called_lock = threading.Lock()
 
         self.tools = self._initialize_tools()
-        self.agent_executor: Optional[AgentExecutor] = None  # Will be created after scene description is ready
+        self.agent = None  # Will be created after scene description is ready
 
         self.chat_history: List[Dict[str, str]] = []
         self.latest_plan: Optional[List[str]] = None
@@ -242,7 +240,7 @@ class Ros2HighLevelAgentNode(Node):
             else:
                 self.scene_description = None
 
-            self.agent_executor = self._create_pddl_agent_executor(
+            self.agent = self._create_pddl_agent(
                 scene_desc=self.scene_description if self.scene_desc_mode != "disabled" else None
             )
             with self._init_lock:
@@ -324,7 +322,7 @@ class Ros2HighLevelAgentNode(Node):
                 with self._init_lock:
                     self.scene_description = "Scene not available"
                     scene_desc = self.scene_description
-                self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_desc)
+                self.agent = self._create_pddl_agent(scene_desc=scene_desc)
                 with self._init_lock:
                     self.initialized = True
                 return
@@ -354,7 +352,7 @@ class Ros2HighLevelAgentNode(Node):
                 with self._init_lock:
                     self.scene_description = "Scene description unavailable"
                     scene_desc = self.scene_description
-                self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_desc)
+                self.agent = self._create_pddl_agent(scene_desc=scene_desc)
                 with self._init_lock:
                     self.initialized = True
                 return
@@ -365,7 +363,7 @@ class Ros2HighLevelAgentNode(Node):
                 with self._init_lock:
                     self.scene_description = "Scene description unavailable"
                     scene_desc = self.scene_description
-                self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_desc)
+                self.agent = self._create_pddl_agent(scene_desc=scene_desc)
                 with self._init_lock:
                     self.initialized = True
                 return
@@ -378,7 +376,7 @@ class Ros2HighLevelAgentNode(Node):
                 with self._init_lock:
                     self.scene_description = "Scene description unavailable"
                     scene_desc = self.scene_description
-                self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_desc)
+                self.agent = self._create_pddl_agent(scene_desc=scene_desc)
                 with self._init_lock:
                     self.initialized = True
                 return
@@ -392,7 +390,7 @@ class Ros2HighLevelAgentNode(Node):
             with self._init_lock:
                 self.scene_description = scene_response if scene_response else "Scene description unavailable"
                 scene_desc = self.scene_description
-            self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_desc)
+            self.agent = self._create_pddl_agent(scene_desc=scene_desc)
             with self._init_lock:
                 self.initialized = True
             
@@ -405,7 +403,7 @@ class Ros2HighLevelAgentNode(Node):
             with self._init_lock:
                 self.scene_description = "Scene description unavailable"
                 scene_desc = self.scene_description
-            self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_desc)
+            self.agent = self._create_pddl_agent(scene_desc=scene_desc)
             with self._init_lock:
                 self.initialized = True
 
@@ -540,18 +538,18 @@ class Ros2HighLevelAgentNode(Node):
                 with self._init_lock:
                     self.scene_description = scene_from_request
                 self.get_logger().info(f"scene_desc=custom: using scene description from request: {scene_from_request}")
-                self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_from_request)
+                self.agent = self._create_pddl_agent(scene_desc=scene_from_request)
             elif self.scene_desc_mode == "disabled":
                 self.scene_description = None
-                if self.agent_executor is None:
-                    self.agent_executor = self._create_pddl_agent_executor(scene_desc=None)
-            elif self.agent_executor is None:
+                if self.agent is None:
+                    self.agent = self._create_pddl_agent(scene_desc=None)
+            elif self.agent is None:
                 with self._init_lock:
                     current_scene = self.scene_description
-                self.agent_executor = self._create_pddl_agent_executor(scene_desc=current_scene)
+                self.agent = self._create_pddl_agent(scene_desc=current_scene)
 
-            if self.agent_executor is None:
-                raise RuntimeError("Agent executor is not initialized")
+            if self.agent is None:
+                raise RuntimeError("Agent is not initialized")
 
             init_predicates: List[Dict[str, Any]] = []
             if self.domain_mode == "default":
@@ -576,19 +574,16 @@ class Ros2HighLevelAgentNode(Node):
                     f"domain={self.domain_mode}: skipping state service init predicates; expecting init from LLM output."
                 )
 
-            # Build LangChain chat history
-            langchain_history = []
+            # Build messages for create_agent invocation.
+            messages = []
             for msg in self.chat_history[:-1]:
-                if msg["role"] == "user":
-                    langchain_history.append(HumanMessage(content=msg["content"]))
-                elif msg["role"] == "assistant":
-                    langchain_history.append(AIMessage(content=msg["content"]))
+                role = msg.get("role")
+                if role in ("user", "assistant"):
+                    messages.append({"role": role, "content": msg.get("content", "")})
+            messages.append({"role": "user", "content": instruction_text})
 
-            # Invoke agent with instruction only (state will be in init block)
-            agent_resp = self.agent_executor.invoke({
-                "input": instruction_text,
-                "chat_history": langchain_history
-            })
+            # Invoke the compiled agent directly (without AgentExecutor wrapper).
+            agent_resp = self.agent.invoke({"messages": messages})
 
             # Extract structured response from agent state
             # According to Langchain docs, structured response is in 'structured_response' key
@@ -1289,7 +1284,7 @@ class Ros2HighLevelAgentNode(Node):
 
         return system_message
 
-    def _create_pddl_agent_executor(self, scene_desc: Optional[str] = None) -> AgentExecutor:
+    def _create_pddl_agent(self, scene_desc: Optional[str] = None):
         """Create an agent that generates planning data using structured output."""
         if scene_desc is None:
             with self._init_lock:
@@ -1305,22 +1300,15 @@ class Ros2HighLevelAgentNode(Node):
         else:
             output_schema = DefaultDomainData
 
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_message),
-            MessagesPlaceholder(variable_name="chat_history", optional=True),
-            ("human", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
-        
         # Use response_format parameter for structured output
         agent = create_agent(
-            llm=self.llm,
+            model=self.llm,
             tools=self.tools,
-            prompt=prompt,
+            system_prompt=system_message,
             response_format=output_schema,
         )
 
-        return AgentExecutor(agent=agent, tools=self.tools, verbose=True, max_iterations=12)
+        return agent
 
     # -----------------------
     # Action server callbacks
