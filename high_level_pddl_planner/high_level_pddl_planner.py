@@ -286,10 +286,13 @@ class Ros2HighLevelAgentNode(Node):
         self.declare_parameter("domain", "default")
         raw_domain_mode = self.get_parameter("domain").get_parameter_value().string_value
         self.domain_mode = self._validate_enum_parameter("domain", raw_domain_mode, DOMAIN_MODES)
+        self.use_chat_history = self.domain_mode == "default"
 
         self.get_logger().info(
             f"Planner configuration: scene_desc={self.scene_desc_mode}, domain={self.domain_mode}"
         )
+        if not self.use_chat_history:
+            self.get_logger().info("Chat history disabled for non-default domain mode.")
 
         self.declare_parameter("ollama_model", "gpt-oss:20b")
         self.ollama_model: str = self.get_parameter("ollama_model").get_parameter_value().string_value
@@ -579,7 +582,11 @@ class Ros2HighLevelAgentNode(Node):
         request_scene_desc: Optional[str] = None,
     ) -> List[str]:
         """Generate a plan using fixed domain and dynamic problem generation."""
-        self.chat_history.append({"role": "user", "content": instruction_text})
+        if not self.use_chat_history:
+            # Stateless operation for classic domains: treat every request independently.
+            self.chat_history.clear()
+        else:
+            self.chat_history.append({"role": "user", "content": instruction_text})
 
         with self._tools_called_lock:
             self._tools_called = []
@@ -634,11 +641,12 @@ Current Planner Domain:
 
             # Build LangChain chat history
             langchain_history = []
-            for msg in self.chat_history[:-1]:
-                if msg["role"] == "user":
-                    langchain_history.append(HumanMessage(content=msg["content"]))
-                elif msg["role"] == "assistant":
-                    langchain_history.append(AIMessage(content=msg["content"]))
+            if self.use_chat_history:
+                for msg in self.chat_history[:-1]:
+                    if msg["role"] == "user":
+                        langchain_history.append(HumanMessage(content=msg["content"]))
+                    elif msg["role"] == "assistant":
+                        langchain_history.append(AIMessage(content=msg["content"]))
 
             # Create augmented instruction with state info
             augmented_instruction = f"{instruction_text}\n\n{state_description}" if state_description else instruction_text
@@ -658,11 +666,13 @@ Current Planner Domain:
                 clarification = final_text_stripped[len("NORMAL"):].lstrip(" :")
                 clarification = clarification or final_text_stripped
                 self.get_logger().info(f"Agent requests clarification: {clarification}")
-                self.chat_history.append({"role": "assistant", "content": clarification})
+                if self.use_chat_history:
+                    self.chat_history.append({"role": "assistant", "content": clarification})
                 self.response_pub.publish(String(data=clarification))
                 return []
 
-            self.chat_history.append({"role": "assistant", "content": final_text})
+            if self.use_chat_history:
+                self.chat_history.append({"role": "assistant", "content": final_text})
 
             self.response_pub.publish(String(data="Generating PDDL problem file"))
 
