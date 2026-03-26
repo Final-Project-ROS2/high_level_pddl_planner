@@ -37,7 +37,6 @@ from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import BaseTool, tool
 from langchain.agents import create_agent
-from langchain.agents.structured_output import ToolStrategy
 from langchain_ollama import ChatOllama
 
 
@@ -586,13 +585,23 @@ class Ros2HighLevelAgentNode(Node):
             # Invoke the compiled agent directly (without AgentExecutor wrapper).
             agent_resp = self.agent.invoke({"messages": messages})
 
-            # Extract structured response from agent state
-            # According to Langchain docs, structured response is in 'structured_response' key
-            agent_output = agent_resp.get("structured_response")
-            
-            if agent_output is None:
-                # Fallback: check for direct output key
-                agent_output = agent_resp.get("output")
+            # Extract structured response from agent state.
+            agent_output = None
+            if isinstance(agent_resp, dict):
+                agent_output = agent_resp.get("structured_response")
+                if agent_output is None:
+                    agent_output = agent_resp.get("output")
+                if agent_output is None:
+                    # Last-resort fallback for agents that only return message state.
+                    msgs = agent_resp.get("messages") or []
+                    if msgs:
+                        last_msg = msgs[-1]
+                        if hasattr(last_msg, "content"):
+                            agent_output = last_msg.content
+                        elif isinstance(last_msg, dict):
+                            agent_output = last_msg.get("content")
+            else:
+                agent_output = agent_resp
             
             self.get_logger().info(f"Agent output (raw): {agent_output}")
 
@@ -1301,16 +1310,20 @@ class Ros2HighLevelAgentNode(Node):
         else:
             output_schema = DefaultDomainData
 
-        # Use ToolStrategy for Ollama (tool-calling structured output). Some Ollama
-        # client versions do not support provider-native response_format arguments.
-        response_format = ToolStrategy(output_schema) if self.use_ollama else output_schema
+        # Enforce structured output at the model wrapper level.
+        if self.use_ollama:
+            model_for_agent = self.llm.with_structured_output(
+                output_schema,
+                method="json_schema",
+                include_raw=False,
+            )
+        else:
+            model_for_agent = self.llm.with_structured_output(output_schema)
 
-        # Use response_format parameter for structured output
         agent = create_agent(
-            model=self.llm,
+            model=model_for_agent,
             tools=self.tools,
             system_prompt=system_message,
-            response_format=response_format,
         )
 
         return agent
