@@ -45,7 +45,7 @@ from dotenv import load_dotenv
 ENV_PATH = '/home/group11/final_project_ws/src/high_level_pddl_planner/.env'
 load_dotenv(dotenv_path=ENV_PATH)
 
-FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", "./fastdownward/fast-downward.py")
+FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", "./fast-downward/fast-downward.py")
 SAS_PATH_PLAN = "/home/group11/final_project_ws/src/high_level_pddl_planner/sas_plan"
 
 SCENE_DESC_MODES = {"default", "custom", "disabled"}
