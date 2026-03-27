@@ -6,12 +6,13 @@ while generating the problem file dynamically based on runtime state queries.
 """
 import os
 import re
+import json
 import tempfile
 import threading
 import time
 import subprocess
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
@@ -23,6 +24,10 @@ from std_msgs.msg import String
 from geometry_msgs.msg import Pose
 
 from custom_interfaces.action import Prompt, PromptScene
+try:
+    from custom_interfaces.action import PromptSceneToken
+except ImportError:
+    PromptSceneToken = None
 from custom_interfaces.srv import (
     DetectObjects,
     ClassifyBBox,
@@ -33,6 +38,7 @@ from custom_interfaces.srv import (
 )
 
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool, tool
 from langchain.agents import AgentExecutor, create_tool_calling_agent
@@ -42,214 +48,36 @@ from langchain_ollama import ChatOllama
 
 from dotenv import load_dotenv
 
-ENV_PATH = '/home/group11/final_project_ws/src/high_level_pddl_planner/.env'
+PROJECT_ROOT = Path("/home/group11/final_project_ws/src/high_level_pddl_planner")
+
+ENV_PATH = Path(os.getenv("ENV_PATH", str(PROJECT_ROOT / ".env")))
 load_dotenv(dotenv_path=ENV_PATH)
 
-FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", "./fastdownward/fast-downward.py")
-SAS_PATH_PLAN = "/home/group11/final_project_ws/src/high_level_pddl_planner/sas_plan"
+FAST_DOWNWARD_PY = os.getenv("FAST_DOWNWARD_PY", str(PROJECT_ROOT / "fast-downward" / "fast-downward.py"))
+TRANSFORM_PY = os.getenv("TRANSFORM_PY", str(PROJECT_ROOT / "transform" / "transform.py"))
+TRANSFORM_BLOCKSWORLD_PY = os.getenv("TRANSFORM_BLOCKSWORLD_PY", str(PROJECT_ROOT / "transform" / "transform_blocksworld.py"))
+TRANSFORM_GRIPPER_PY = os.getenv("TRANSFORM_GRIPPER_PY", str(PROJECT_ROOT / "transform" / "transform_gripper.py"))
+
+TEMPLATE_PROBLEM = os.getenv("TEMPLATE_PROBLEM", str(PROJECT_ROOT / "problems" / "template_problem.pddl"))
+TEMPLATE_PROBLEM_BLOCKSWORLD = os.getenv(
+    "TEMPLATE_PROBLEM_BLOCKSWORLD",
+    str(PROJECT_ROOT / "problems" / "template_problem_blocksworld.pddl"),
+)
+TEMPLATE_PROBLEM_GRIPPER = os.getenv(
+    "TEMPLATE_PROBLEM_GRIPPER",
+    str(PROJECT_ROOT / "problems" / "template_problem_gripper.pddl"),
+)
+
+DOMAIN_PDDL = os.getenv("DOMAIN_PDDL", str(PROJECT_ROOT / "domains" / "domain.pddl"))
+DOMAIN_PDDL_BLOCKSWORLD = os.getenv("DOMAIN_PDDL_BLOCKSWORLD", str(PROJECT_ROOT / "domains" / "domain_blocksworld.pddl"))
+DOMAIN_PDDL_GRIPPER = os.getenv("DOMAIN_PDDL_GRIPPER", str(PROJECT_ROOT / "domains" / "domain_gripper.pddl"))
 
 SCENE_DESC_MODES = {"default", "custom", "disabled"}
 DOMAIN_MODES = {"default", "blocksworld", "gripper"}
 
-# Fixed PDDL domain templates by mode
-FIXED_DOMAIN_DEFAULT = """
-(define (domain robot-manipulation)
-  (:requirements :strips :typing :conditional-effects)
-  
-  (:types
-    location direction object
-  )
-  
-  (:predicates
-    (robot-at-location ?loc - location)
-    (robot-at-object ?obj - object)
-    (object-at-location ?obj - object ?loc - location)
-    (robot-have ?obj - object)
-    (gripper-open)
-    (gripper-closed)
-  )
-  
-  (:action move_to_home
-    :parameters ()
-    :precondition (and)
-    :effect (and
-      (robot-at-location home)
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-      (forall (?obj - object) (not (robot-at-object ?obj)))
-    )
-  )
-  
-  (:action move_to_ready
-    :parameters ()
-    :precondition (and)
-    :effect (and
-      (robot-at-location ready)
-      (not (robot-at-location home))
-      (not (robot-at-location handover))
-      (forall (?obj - object) (not (robot-at-object ?obj)))
-    )
-  )
-
-  (:action move_to_handover
-    :parameters ()
-    :precondition (and)
-    :effect (and
-      (robot-at-location handover)
-      (not (robot-at-location home))
-      (not (robot-at-location ready))
-      (forall (?obj - object) (not (robot-at-object ?obj)))
-    )
-  )
-  
-  (:action open_gripper
-    :parameters ()
-    :precondition (gripper-closed)
-    :effect (and
-      (gripper-open)
-      (not (gripper-closed))
-    )
-  )
-  
-  (:action close_gripper
-    :parameters ()
-    :precondition (gripper-open)
-    :effect (and
-      (gripper-closed)
-      (not (gripper-open))
-    )
-  )
-  
-  (:action move_to_direction
-    :parameters (?dir - direction)
-    :precondition (and)
-    :effect (and
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-      (forall (?obj - object) (not (robot-at-object ?obj)))
-      (not (robot-at-location home))
-      (not (robot-at-location ready))
-    )
-  )
-
-  (:action move_to_object
-    :parameters (?obj - object)
-    :precondition (and
-      (robot-at-location ready)
-    )
-    :effect (and
-      (robot-at-object ?obj)
-      (not (robot-at-location home))
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-    )
-  )
-
-  (:action pick-object
-    :parameters (?obj - object)
-    :precondition (and
-      (robot-at-location ready)
-    )
-    :effect (and
-      (robot-at-object ?obj)
-      (robot-have ?obj)
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-      (forall (?obj2 - object) (when (not (= ?obj ?obj2)) (not (robot-at-object ?obj2))))
-      (not (robot-at-location home))
-      (not (robot-at-location ready))
-      (not (robot-at-location handover))
-    )
-  )
-
-  (:action place-object
-    :parameters (?obj - object ?place - location)
-    :precondition (and
-      (robot-have ?obj)
-    )
-    :effect (and
-      (robot-at-location ?place)
-      (not (robot-have ?obj))
-      (forall (?obj2 - object) (when (not (= ?obj ?obj2)) (not (robot-at-object ?obj2))))
-      (object-at-location ?obj ?place)
-    )
-  )
-)
-"""
-
-
-FIXED_DOMAIN_BLOCKSWORLD = """
-(define (domain blocksworld)
-(:requirements :strips :equality)
-(:predicates (clear ?x)
-                         (on-table ?x)
-                         (arm-empty)
-                         (holding ?x)
-                         (on ?x ?y))
-
-(:action pickup
-    :parameters (?ob)
-    :precondition (and (clear ?ob) (on-table ?ob) (arm-empty))
-    :effect (and (holding ?ob) (not (clear ?ob)) (not (on-table ?ob))
-                             (not (arm-empty))))
-
-(:action putdown
-    :parameters  (?ob)
-    :precondition (and (holding ?ob))
-    :effect (and (clear ?ob) (arm-empty) (on-table ?ob)
-                             (not (holding ?ob))))
-
-(:action stack
-    :parameters  (?ob ?underob)
-    :precondition (and  (clear ?underob) (holding ?ob))
-    :effect (and (arm-empty) (clear ?ob) (on ?ob ?underob)
-                             (not (clear ?underob)) (not (holding ?ob))))
-
-(:action unstack
-    :parameters  (?ob ?underob)
-    :precondition (and (on ?ob ?underob) (clear ?ob) (arm-empty))
-    :effect (and (holding ?ob) (clear ?underob)
-                             (not (on ?ob ?underob)) (not (clear ?ob)) (not (arm-empty)))))
-"""
-
-
-FIXED_DOMAIN_GRIPPER = """
-(define (domain gripper)
-(:requirements :strips)
-(:predicates (room ?r)
-                         (ball ?b)
-                         (gripper ?g)
-                         (at-robby ?r)
-                         (at ?b ?r)
-                         (free ?g)
-                         (carry ?o ?g))
-
-        (:action move
-                :parameters  (?from ?to)
-                :precondition (and  (room ?from) (room ?to) (at-robby ?from))
-                :effect (and  (at-robby ?to) (not (at-robby ?from))))
-
-        (:action pick
-                :parameters (?obj ?room ?gripper)
-                :precondition  (and  (ball ?obj) (room ?room) (gripper ?gripper)
-                                         (at ?obj ?room) (at-robby ?room) (free ?gripper))
-                :effect (and (carry ?obj ?gripper) (not (at ?obj ?room))
-                            (not (free ?gripper))))
-
-        (:action drop
-                :parameters  (?obj  ?room ?gripper)
-                :precondition  (and  (ball ?obj) (room ?room) (gripper ?gripper)
-                                         (carry ?obj ?gripper) (at-robby ?room))
-        :effect (and (at ?obj ?room) (free ?gripper) (not (carry ?obj ?gripper))))
-)
-"""
-
-
 class PDDLGenerationResult:
-    def __init__(self, domain_pddl: str, problem_pddl: str, reasoning: str = ""):
-        self.domain_pddl = domain_pddl
-        self.problem_pddl = problem_pddl
-        self.reasoning = reasoning
+    def __init__(self, json_data: Dict[str, Any]):
+        self.json_data = json_data
 
 
 class PlanningResult:
@@ -260,6 +88,62 @@ class PlanningResult:
         self.stderr = stderr
         self.plan = plan
         self.plan_length = len([l for l in plan.splitlines() if l.strip()])
+
+
+class OllamaTokenUsageTracker(BaseCallbackHandler):
+    """Aggregate prompt/completion token usage across all LLM calls in one agent run."""
+
+    def __init__(self):
+        super().__init__()
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    @staticmethod
+    def _to_int(value: Any) -> int:
+        try:
+            if value is None:
+                return 0
+            return max(0, int(value))
+        except Exception:
+            return 0
+
+    def on_llm_end(self, response, **kwargs) -> None:
+        llm_output = getattr(response, "llm_output", {}) or {}
+        token_usage = llm_output.get("token_usage") or llm_output.get("usage") or {}
+
+        input_tokens = self._to_int(
+            token_usage.get("prompt_tokens") or token_usage.get("input_tokens")
+        )
+        output_tokens = self._to_int(
+            token_usage.get("completion_tokens") or token_usage.get("output_tokens")
+        )
+        if input_tokens or output_tokens:
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
+            return
+
+        for generation_list in getattr(response, "generations", []) or []:
+            for generation in generation_list:
+                msg = getattr(generation, "message", None)
+                if msg is None:
+                    continue
+
+                usage_metadata = getattr(msg, "usage_metadata", None) or {}
+                input_tokens = self._to_int(
+                    usage_metadata.get("input_tokens") or usage_metadata.get("prompt_tokens")
+                )
+                output_tokens = self._to_int(
+                    usage_metadata.get("output_tokens") or usage_metadata.get("completion_tokens")
+                )
+                if input_tokens or output_tokens:
+                    self.input_tokens += input_tokens
+                    self.output_tokens += output_tokens
+                    continue
+
+                # Ollama typically returns these counters.
+                response_metadata = getattr(msg, "response_metadata", None) or {}
+                self.input_tokens += self._to_int(response_metadata.get("prompt_eval_count"))
+                self.output_tokens += self._to_int(response_metadata.get("eval_count"))
 
 
 class Ros2HighLevelAgentNode(Node):
@@ -286,13 +170,10 @@ class Ros2HighLevelAgentNode(Node):
         self.declare_parameter("domain", "default")
         raw_domain_mode = self.get_parameter("domain").get_parameter_value().string_value
         self.domain_mode = self._validate_enum_parameter("domain", raw_domain_mode, DOMAIN_MODES)
-        self.use_chat_history = self.domain_mode == "default"
 
         self.get_logger().info(
             f"Planner configuration: scene_desc={self.scene_desc_mode}, domain={self.domain_mode}"
         )
-        if not self.use_chat_history:
-            self.get_logger().info("Chat history disabled for non-default domain mode.")
 
         self.declare_parameter("ollama_model", "gpt-oss:20b")
         self.ollama_model: str = self.get_parameter("ollama_model").get_parameter_value().string_value
@@ -343,10 +224,24 @@ class Ros2HighLevelAgentNode(Node):
         self.chat_history: List[Dict[str, str]] = []
         self.latest_plan: Optional[List[str]] = None
         self.latest_pddl: Optional[PDDLGenerationResult] = None
+        self.last_goal_state: Optional[List[Dict[str, Any]]] = None  # Store goal state from previous successful execution
+        self.initial_state_summary: Optional[str] = None
 
         self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
+        self.reset_state_srv = self.create_service(Trigger, "/reset_state", self.reset_state_callback)
 
-        self.high_level_action_type = PromptScene if self.scene_desc_mode == "custom" else Prompt
+        if self.use_ollama and PromptSceneToken is not None:
+            self.high_level_action_type = PromptSceneToken
+        elif self.scene_desc_mode == "custom":
+            self.high_level_action_type = PromptScene
+        else:
+            self.high_level_action_type = Prompt
+
+        if self.use_ollama and PromptSceneToken is None:
+            self.get_logger().warn(
+                "PromptSceneToken action interface is not available. "
+                "Falling back to existing high-level action interfaces without token fields."
+            )
 
         self._action_server = ActionServer(
             self,
@@ -358,6 +253,7 @@ class Ros2HighLevelAgentNode(Node):
         )
 
         self.response_pub = self.create_publisher(String, "/response", 10)
+        self.tts_pub = self.create_publisher(String, "/tts", 10)
         self.benchmark_pub = self.create_publisher(String, "/benchmark_logs", 10)
 
         if self.scene_desc_mode == "default":
@@ -390,6 +286,49 @@ class Ros2HighLevelAgentNode(Node):
             f"Valid values: {sorted(valid_values)}"
         )
         return fallback
+
+    def _format_for_tts(self, text: str) -> str:
+        """
+        Convert text to a format suitable for text-to-speech.
+        - Removes excessive formatting characters
+        - Converts numbered lists to natural language
+        - Simplifies technical jargon
+        - Makes text more conversational
+        """
+        if not text:
+            return ""
+        
+        # Replace multiple newlines with single space
+        tts_text = text.replace("\n", " ").replace("\r", " ")
+        
+        # Replace multiple spaces with single space
+        tts_text = " ".join(tts_text.split())
+        
+        # Convert numbered list items (e.g., "1. Do X" -> "Step one, do X")
+        tts_text = re.sub(r'^\d+\.\s+', lambda m: f"Step {self._number_to_word(int(m.group(0).split('.')[0]))}, ", tts_text)
+        
+        # Remove trailing punctuation that doesn't help TTS (multiple exclamation marks, question marks)
+        tts_text = re.sub(r'([!?])\1+', r'\1', tts_text)
+        
+        # Simplify "PDDL" references in speech
+        tts_text = tts_text.replace(" PDDL ", " ")
+        tts_text = tts_text.replace("PDDL planning", "planning")
+        
+        return tts_text.strip()
+    
+    def _number_to_word(self, num: int) -> str:
+        """Convert a number to its word representation (1-20, and tens)"""
+        ones = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+                "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+                "seventeen", "eighteen", "nineteen"]
+        tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+        
+        if num < 20:
+            return ones[num]
+        elif num < 100:
+            return tens[num // 10] + ("" if num % 10 == 0 else " " + ones[num % 10])
+        else:
+            return str(num)  # For larger numbers, just use str representation
 
     def _benchmark_log(self, label: str):
         t = self.get_clock().now()
@@ -484,6 +423,7 @@ class Ros2HighLevelAgentNode(Node):
             
             self.get_logger().info(f"Scene description obtained: {self.scene_description}")
             self.response_pub.publish(String(data=f"Scene analysis: {self.scene_description}"))
+            self.tts_pub.publish(String(data=self._format_for_tts(f"I've analyzed the scene. {self.scene_description}")))
             
         except Exception as e:
             self.get_logger().error(f"Exception during scene initialization: {e}")
@@ -536,10 +476,30 @@ class Ros2HighLevelAgentNode(Node):
         state['robot_at_ready'] = is_ready if is_ready is not None else False
         state['robot_in_handover'] = is_handover if is_handover is not None else False
         state['gripper_open'] = gripper_open if gripper_open is not None else True
-        state['gripper_closed'] = not state['gripper_open']
+        state['gripper_close'] = not state['gripper_open']
         
         self.get_logger().info(f"Current state: {state}")
         return state
+
+    def _state_to_init_predicates(self, current_state: Dict[str, bool]) -> List[Dict[str, Any]]:
+        """Convert current state dict to PDDL init predicates for template."""
+        init_predicates = []
+        
+        # Add location predicates
+        if current_state.get('robot_at_home'):
+            init_predicates.append({"predicate": "robot-at-location", "args": ["home"]})
+        if current_state.get('robot_at_ready'):
+            init_predicates.append({"predicate": "robot-at-location", "args": ["ready"]})
+        if current_state.get('robot_in_handover'):
+            init_predicates.append({"predicate": "robot-at-location", "args": ["handover"]})
+        
+        # Add gripper predicates
+        if current_state.get('gripper_open'):
+            init_predicates.append({"predicate": "gripper-open", "args": []})
+        if current_state.get('gripper_close'):
+            init_predicates.append({"predicate": "gripper-close", "args": []})
+        
+        return init_predicates
 
     # -----------------------
     # Transcript handling
@@ -561,6 +521,7 @@ class Ros2HighLevelAgentNode(Node):
         if not self.initialized:
             self.get_logger().warn("Node not fullly initialized yet. Ignoring transcript.")
             self.response_pub.publish(String(data="Still initializing, please wait a moment..."))
+            self.tts_pub.publish(String(data="Still initializing, please wait a moment."))
 
         start_time = time.perf_counter()
         self._benchmark_log("transcript_received")
@@ -580,21 +541,25 @@ class Ros2HighLevelAgentNode(Node):
         instruction_text: str,
         start_time: Optional[float] = None,
         request_scene_desc: Optional[str] = None,
-    ) -> List[str]:
+    ) -> Tuple[List[str], int, int]:
         """Generate a plan using fixed domain and dynamic problem generation."""
-        if not self.use_chat_history:
-            # Stateless operation for classic domains: treat every request independently.
+        # Make blocksworld/gripper runs stateless by dropping any prior turns
+        if self.domain_mode != "default":
             self.chat_history.clear()
-        else:
-            self.chat_history.append({"role": "user", "content": instruction_text})
+        self.chat_history.append({"role": "user", "content": instruction_text})
 
         with self._tools_called_lock:
             self._tools_called = []
 
+        input_token_count = 0
+        output_token_count = 0
+
         try:
             self.get_logger().info("High-level agent (PDDL): generating plan with fixed domain...")
             self.response_pub.publish(String(data="Got it! Let me think through that..."))
+            self.tts_pub.publish(String(data="Got it. Let me think through that."))
             self.response_pub.publish(String(data="Analyzing scene and determining current state"))
+            self.tts_pub.publish(String(data="Analyzing the scene and determining the current state."))
 
             if self.scene_desc_mode == "custom":
                 scene_from_request = (request_scene_desc or "").strip()
@@ -619,46 +584,77 @@ class Ros2HighLevelAgentNode(Node):
             if self.agent_executor is None:
                 raise RuntimeError("Agent executor is not initialized")
 
-            state_description = ""
+            init_predicates: List[Dict[str, Any]] = []
             if self.domain_mode == "default":
-                # Get current state from services (robot-manipulation domain only)
+                # Get current state from services
                 current_state = self._get_current_state()
-                state_description = f"""
-Current Robot State:
-- Robot at home: {current_state['robot_at_home']}
-- Robot at ready: {current_state['robot_at_ready']}
-- Robot at handover: {current_state['robot_in_handover']}
-- Gripper open: {current_state['gripper_open']}
-- Gripper closed: {current_state['gripper_closed']}
-"""
+
+                # Convert current state to init predicates for PDDL template
+                init_predicates = self._state_to_init_predicates(current_state)
+
+                # Merge with last goal state if available (continuous state tracking)
+                if self.last_goal_state:
+                    self.get_logger().info(f"Merging previous goal state into init: {self.last_goal_state}")
+                    # Add previous goals to init, avoiding duplicates
+                    existing_predicates = {(p["predicate"], tuple(p.get("args", []))): p for p in init_predicates}
+                    for goal in self.last_goal_state:
+                        key = (goal["predicate"], tuple(goal.get("args", [])))
+                        if key not in existing_predicates:
+                            init_predicates.append(goal)
+                    self.get_logger().info(f"Combined init predicates: {init_predicates}")
             else:
-                state_description = f"""
-Current Planner Domain:
-- Mode: {self.domain_mode}
-- Runtime robot-state services are not used in this domain mode.
-- Infer a valid initial state for the selected domain from scene description and instruction.
-"""
+                self.get_logger().info(
+                    f"domain={self.domain_mode}: skipping state service init predicates; expecting init from LLM output."
+                )
 
             # Build LangChain chat history
             langchain_history = []
-            if self.use_chat_history:
-                for msg in self.chat_history[:-1]:
-                    if msg["role"] == "user":
-                        langchain_history.append(HumanMessage(content=msg["content"]))
-                    elif msg["role"] == "assistant":
-                        langchain_history.append(AIMessage(content=msg["content"]))
+            for msg in self.chat_history[:-1]:
+                if msg["role"] == "user":
+                    langchain_history.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant":
+                    langchain_history.append(AIMessage(content=msg["content"]))
 
-            # Create augmented instruction with state info
-            augmented_instruction = f"{instruction_text}\n\n{state_description}" if state_description else instruction_text
+            # Invoke agent with instruction only (state will be in init block)
+            invoke_payload = {
+                "input": instruction_text,
+                "chat_history": langchain_history,
+            }
 
-            # Invoke agent
-            agent_resp = self.agent_executor.invoke({
-                "input": augmented_instruction,
-                "chat_history": langchain_history
-            })
+            token_tracker: Optional[OllamaTokenUsageTracker] = None
+            if self.use_ollama:
+                token_tracker = OllamaTokenUsageTracker()
+                try:
+                    agent_resp = self.agent_executor.invoke(
+                        invoke_payload,
+                        config={"callbacks": [token_tracker]},
+                    )
+                except TypeError:
+                    # Compatibility with older LangChain invoke signatures.
+                    agent_resp = self.agent_executor.invoke(
+                        invoke_payload,
+                        callbacks=[token_tracker],
+                    )
+            else:
+                agent_resp = self.agent_executor.invoke(invoke_payload)
 
             final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
             self.get_logger().info(f"Agent output (raw):\n{final_text}")
+
+            if token_tracker is not None:
+                input_token_count = int(token_tracker.input_tokens)
+                output_token_count = int(token_tracker.output_tokens)
+
+                if input_token_count <= 0:
+                    input_token_count = self._estimate_token_count(
+                        instruction_text + "\n" + "\n".join(m["content"] for m in self.chat_history[:-1])
+                    )
+                if output_token_count <= 0:
+                    output_token_count = self._estimate_token_count(final_text)
+
+                self.get_logger().info(
+                    f"Ollama token usage: input={input_token_count}, output={output_token_count}"
+                )
 
             # If the agent is asking a clarifying question (prefixed with NORMAL), just relay it
             final_text_stripped = final_text.strip()
@@ -666,44 +662,73 @@ Current Planner Domain:
                 clarification = final_text_stripped[len("NORMAL"):].lstrip(" :")
                 clarification = clarification or final_text_stripped
                 self.get_logger().info(f"Agent requests clarification: {clarification}")
-                if self.use_chat_history:
-                    self.chat_history.append({"role": "assistant", "content": clarification})
+                self.chat_history.append({"role": "assistant", "content": clarification})
                 self.response_pub.publish(String(data=clarification))
-                return []
+                self.tts_pub.publish(String(data=self._format_for_tts(clarification)))
+                return [], input_token_count, output_token_count
 
-            if self.use_chat_history:
-                self.chat_history.append({"role": "assistant", "content": final_text})
+            self.chat_history.append({"role": "assistant", "content": final_text})
 
-            self.response_pub.publish(String(data="Generating PDDL problem file"))
+            self.response_pub.publish(String(data="Generating planning data and PDDL problem file"))
+            self.tts_pub.publish(String(data="Generating planning data."))
 
-            # Parse DOMAIN and PROBLEM from LLM output
-            pddl_gen = self._parse_domain_and_problem_from_text(final_text)
-            if pddl_gen is None:
-                msg = "Hmm... I couldn't generate valid PDDL files. Could you try rephrasing that?"
-                self.get_logger().error("Failed to parse PDDL domain/problem from LLM output.")
+            planning_payload = self._parse_planning_json(final_text)
+            if not planning_payload:
+                msg = "Hmm... I couldn't generate valid planning data. Could you try rephrasing that?"
+                self.get_logger().error("LLM response could not be parsed into planning JSON.")
                 self.response_pub.publish(String(data=msg))
-                return []
+                self.tts_pub.publish(String(data=self._format_for_tts(msg)))
+                return [], input_token_count, output_token_count
 
-            # Use LLM-generated domain (which may be modified from the template)
-            domain_pddl = pddl_gen.domain_pddl
-            problem_pddl = pddl_gen.problem_pddl
-            
-            # Store PDDL for reference
-            self.latest_pddl = PDDLGenerationResult(domain_pddl=domain_pddl, problem_pddl=problem_pddl)
+            if self.domain_mode != "default":
+                init_predicates = planning_payload.get("init", [])
 
-            # Save PDDL to temporary directory
+            self.initial_state_summary = self._format_predicates(init_predicates)
+
+            json_gen_data = {
+                "locations": planning_payload.get("locations", []),
+                "objects": planning_payload.get("objects", []),
+                "goals": planning_payload.get("goals", []),
+                "init": init_predicates,
+            }
+
+            # Store JSON for reference
+            json_result = PDDLGenerationResult(json_data=json_gen_data)
+            self.latest_pddl = json_result
+
+            # Save JSON and generate PDDL using transform.py
             tmpdir = tempfile.mkdtemp(prefix="pddl_")
-            domain_path = Path(tmpdir) / "domain.pddl"
+            json_path = Path(tmpdir) / "data.json"
             problem_path = Path(tmpdir) / "problem.pddl"
-            domain_path.write_text(domain_pddl)
-            problem_path.write_text(problem_pddl)
-            self.get_logger().info(f"PDDL files saved to {tmpdir}")
-            self.get_logger().debug(f"Domain:\n{domain_pddl}")
-            self.get_logger().debug(f"Problem:\n{problem_pddl}")
+            
+            # Write JSON data to file
+            json_data = {"data": json_gen_data}
+            json_path.write_text(json.dumps(json_data, indent=2))
+            self.get_logger().info(f"JSON data saved to {json_path}")
+            self.get_logger().debug(f"JSON data:\n{json.dumps(json_data, indent=2)}")
 
-            # Run Fast Downward
+            template_problem = self._get_template_problem_path()
+            domain_pddl = self._get_domain_pddl_path()
+
+            # Call transform.py to generate problem PDDL
+            self.get_logger().info(
+                f"Calling transform.py to generate problem file with template: {template_problem}"
+            )
+            transform_result = self._run_transform(template_problem, str(json_path), str(problem_path))
+            
+            if not transform_result or not problem_path.exists():
+                msg = "Failed to generate PDDL problem file. Transform failed."
+                self.get_logger().error("Transform failed or problem file not created.")
+                self.response_pub.publish(String(data=msg))
+                self.tts_pub.publish(String(data="Failed to generate the planning file. Please try again."))
+                return [], input_token_count, output_token_count
+
+            self.get_logger().debug(f"Problem:\n{problem_path.read_text()}")
+
+            # Run Fast Downward with domain.pddl and generated problem.pddl
             self.response_pub.publish(String(data="Solving the PDDL problem using Fast Downward"))
-            plan_result = self._run_fast_downward(str(domain_path), str(problem_path))
+            self.tts_pub.publish(String(data="Now solving the planning problem."))
+            plan_result = self._run_fast_downward(domain_pddl, str(problem_path))
 
             if start_time is not None:
                 end_time = time.perf_counter()
@@ -714,7 +739,9 @@ Current Planner Domain:
                 msg = f"I couldn't find a valid plan. The planner returned: {plan_result.status}"
                 self.get_logger().warn(f"Planner returned no plan. status={plan_result.status} rc={plan_result.return_code}")
                 self.response_pub.publish(String(data=msg))
-                return []
+                self.tts_pub.publish(String(data="I couldn't find a valid plan for that request. Could you try rephrasing it?"))
+                # Keep last_goal_state intact - planning failed but state hasn't changed
+                return [], input_token_count, output_token_count
 
             self.get_logger().info("Plan obtained from Fast Downward. Parsing to steps...")
             plan_lines = self._parse_plan_text(plan_result.plan)
@@ -722,7 +749,9 @@ Current Planner Domain:
                 msg = "No actionable steps could be parsed from the plan."
                 self.get_logger().warn("No actionable plan lines parsed.")
                 self.response_pub.publish(String(data=msg))
-                return []
+                self.tts_pub.publish(String(data="I couldn't parse the plan into steps. Please try again."))
+                # Keep last_goal_state intact - parsing failed but state hasn't changed
+                return [], input_token_count, output_token_count
 
             self.latest_plan = plan_lines
 
@@ -731,44 +760,79 @@ Current Planner Domain:
                 self.response_pub.publish(String(
                     data=f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and confirm if this looks good!"
                 ))
+                # Create a more natural TTS version of the plan
+                tts_plan = ". ".join([s for s in plan_lines])
+                self.tts_pub.publish(String(data=f"Here is my plan: {tts_plan}. Please confirm if this looks good."))
                 self.get_logger().info(f"Generated plan with {len(plan_lines)} steps, waiting for /confirm.")
             else:
                 def execute_plan():
                     self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
+                    self.tts_pub.publish(String(data="Executing the plan now."))
                     self.get_logger().info("Executing confirmed plan...")
 
                     for i, step in enumerate(self.latest_plan, start=1):
+                        actions_completed = self.latest_plan[: i - 1]
+                        step_payload = self._compose_step_instruction(step, actions_completed)
+
                         self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
-                        result = self.send_step_to_medium_async(step)
+                        self.tts_pub.publish(String(data=self._format_for_tts(f"Step {i}: {step}")))
+                        result = self.send_step_to_medium_async(step_payload)
 
                         if result is None or not result.success:
                             msg = f"Step {i} failed: {step}. Stopping execution."
                             self.response_pub.publish(String(data=msg))
+                            self.tts_pub.publish(String(data=f"Step {i} failed. Stopping execution."))
                             self.get_logger().error(msg)
+                            # Clear last goal state on execution failure - state is now uncertain after partial execution
+                            self.last_goal_state = None
                             break
                         else:
                             done_msg = f"Step {i} completed successfully."
                             self.response_pub.publish(String(data=done_msg))
+                            self.tts_pub.publish(String(data=f"Step {i} completed."))
                             self.get_logger().info(done_msg)
 
                     end_time = time.perf_counter()
                     benchmark_info = f"High-level action completed in {end_time - self.start_time:.2f} seconds."
                     self.benchmark_pub.publish(String(data=benchmark_info))
                     self.response_pub.publish(String(data="Plan execution finished."))
-                    self.get_logger().info("All steps done. Clearing chat history and plan.")
+                    self.tts_pub.publish(String(data="Plan execution finished."))
+                    self.get_logger().info("All steps done. Storing goal state for continuous tracking.")
+                    
+                    # Store goal state from successfully executed plan for next instruction
+                    if self.latest_pddl and self.latest_pddl.json_data:
+                        self.last_goal_state = self.latest_pddl.json_data.get("goals", [])
+                        self.get_logger().info(f"Stored goal state for next instruction: {self.last_goal_state}")
+                    
                     self.chat_history.clear()
                     self.latest_plan = None
                     self.latest_pddl = None
+                    self.initial_state_summary = None
 
                 execution_thread = threading.Thread(target=execute_plan, daemon=True)
                 execution_thread.start()
 
-            return plan_lines
+            return plan_lines, input_token_count, output_token_count
 
         except Exception as e:
             self.get_logger().error(f"Error generating plan: {e}")
             self.response_pub.publish(String(data="Sorry, something went wrong while planning."))
-            return []
+            self.tts_pub.publish(String(data="Sorry, something went wrong. Please try again."))
+            # Keep last_goal_state intact - planning exception but state hasn't changed
+            return [], input_token_count, output_token_count
+
+    def _estimate_token_count(self, text: str) -> int:
+        """Best-effort token estimate when provider token metadata is unavailable."""
+        if not text:
+            return 0
+        try:
+            if hasattr(self.llm, "get_num_tokens"):
+                count = self.llm.get_num_tokens(text)
+                if isinstance(count, int) and count >= 0:
+                    return count
+        except Exception:
+            pass
+        return len(text.split())
 
     def confirm_service_callback(self, request, response):
         """Execute the latest plan when confirmed."""
@@ -776,37 +840,56 @@ Current Planner Domain:
             response.success = False
             response.message = "Node not yet initialized. Please wait for scene analysis to complete."
             self.response_pub.publish(String(data=response.message))
+            self.tts_pub.publish(String(data="Node is still initializing. Please wait."))
             return response
 
         if not self.latest_plan:
             response.success = False
             response.message = "No plan to confirm. Please give a new instruction first."
             self.response_pub.publish(String(data=response.message))
+            self.tts_pub.publish(String(data="No plan to confirm. Please give me a new instruction."))
             return response
 
         def execute_plan():
             self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
+            self.tts_pub.publish(String(data="Executing the plan now."))
             self.get_logger().info("Executing confirmed plan...")
 
             for i, step in enumerate(self.latest_plan, start=1):
+                actions_completed = self.latest_plan[: i - 1]
+                step_payload = self._compose_step_instruction(step, actions_completed)
+
                 self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
-                result = self.send_step_to_medium_async(step)
+                self.tts_pub.publish(String(data=self._format_for_tts(f"Step {i}: {step}")))
+                result = self.send_step_to_medium_async(step_payload)
 
                 if result is None or not result.success:
                     msg = f"Step {i} failed: {step}. Stopping execution."
                     self.response_pub.publish(String(data=msg))
+                    self.tts_pub.publish(String(data=f"Step {i} failed. Stopping execution."))
                     self.get_logger().error(msg)
+                    # Clear last goal state on execution failure - state is now uncertain after partial execution
+                    self.last_goal_state = None
                     break
                 else:
                     done_msg = f"Step {i} completed successfully."
                     self.response_pub.publish(String(data=done_msg))
+                    self.tts_pub.publish(String(data=f"Step {i} completed."))
                     self.get_logger().info(done_msg)
 
             self.response_pub.publish(String(data="Plan execution finished."))
-            self.get_logger().info("All steps done. Clearing chat history and plan.")
+            self.tts_pub.publish(String(data="Plan execution finished."))
+            self.get_logger().info("All steps done. Storing goal state for continuous tracking.")
+            
+            # Store goal state from successfully executed plan for next instruction
+            if self.latest_pddl and self.latest_pddl.json_data:
+                self.last_goal_state = self.latest_pddl.json_data.get("goals", [])
+                self.get_logger().info(f"Stored goal state for next instruction: {self.last_goal_state}")
+            
             self.chat_history.clear()
             self.latest_plan = None
             self.latest_pddl = None
+            self.initial_state_summary = None
 
         execution_thread = threading.Thread(target=execute_plan, daemon=True)
         execution_thread.start()
@@ -815,48 +898,54 @@ Current Planner Domain:
         response.message = "Plan execution started."
         return response
 
+    def reset_state_callback(self, request, response):
+        """Reset the stored goal state to start fresh."""
+        self.last_goal_state = None
+        self.chat_history.clear()
+        self.latest_plan = None
+        self.latest_pddl = None
+        self.initial_state_summary = None
+        
+        response.success = True
+        response.message = "State has been reset. Ready for new instructions."
+        self.get_logger().info("State reset via /reset_state service")
+        self.response_pub.publish(String(data=response.message))
+        self.tts_pub.publish(String(data=response.message))
+        return response
+
     # -----------------------
-    # PDDL parsing helpers
+    # JSON and Transform helpers
     # -----------------------
-    def _parse_domain_and_problem_from_text(self, text: str) -> Optional[PDDLGenerationResult]:
-        """Extract DOMAIN and PROBLEM PDDL from LLM output."""
+    def _run_transform(self, template_file: str, data_json_file: str, output_file: str) -> bool:
+        """Call the appropriate transform script to generate problem PDDL from template and JSON data."""
+        workdir = str(Path(template_file).parent)
+
+        if self.domain_mode == "blocksworld":
+            transform_script = TRANSFORM_BLOCKSWORLD_PY
+        elif self.domain_mode == "gripper":
+            transform_script = TRANSFORM_GRIPPER_PY
+        else:
+            transform_script = TRANSFORM_PY
+
+        cmd = ["python3", transform_script, template_file, data_json_file, output_file]
+        self.get_logger().info(f"Calling transform script ({self.domain_mode}): {' '.join(cmd)} (workdir={workdir})")
         try:
-            # Try code fence format first
-            domain_match = re.search(r"DOMAIN:\s*```pddl\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-            problem_match = re.search(r"PROBLEM:\s*```pddl\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-            
-            if domain_match and problem_match:
-                domain = domain_match.group(1).strip()
-                problem = problem_match.group(1).strip()
-                reasoning_match = re.search(r"REASONING:\s*(.*?)(?=DOMAIN:|PROBLEM:|$)", text, re.DOTALL | re.IGNORECASE)
-                reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
-                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning=reasoning)
-
-            # Try simple split
-            if "DOMAIN:" in text and "PROBLEM:" in text:
-                domain_part = text.split("DOMAIN:")[1].split("PROBLEM:")[0].strip()
-                problem_part = text.split("PROBLEM:")[1].strip()
-                domain = domain_part.strip("` \n")
-                problem = problem_part.strip("` \n")
-                reasoning_match = re.search(r"REASONING:\s*(.*?)(?=DOMAIN:|PROBLEM:|$)", text, re.DOTALL | re.IGNORECASE)
-                reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
-                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning=reasoning)
-
-            # Try finding define blocks
-            domain_paren = re.search(r"\(define\s*\(domain.*?\)\)", text, re.DOTALL | re.IGNORECASE)
-            problem_paren = re.search(r"\(define\s*\(problem.*?\)\)", text, re.DOTALL | re.IGNORECASE)
-            if domain_paren and problem_paren:
-                domain = domain_paren.group(0).strip()
-                problem = problem_paren.group(0).strip()
-                return PDDLGenerationResult(domain_pddl=domain, problem_pddl=problem, reasoning="")
-                
+            result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=60)
+            self.get_logger().info(f"Transform stdout:\n{result.stdout}")
+            if result.returncode != 0:
+                self.get_logger().error(f"Transform failed with return code {result.returncode}: {result.stderr}")
+                return False
+            return True
+        except subprocess.TimeoutExpired:
+            self.get_logger().error("Transform timed out")
+            return False
         except Exception as e:
-            self.get_logger().error(f"Error extracting PDDL from text: {e}")
-        return None
+            self.get_logger().error(f"Error calling transform.py: {e}")
+            return False
 
     def _run_fast_downward(self, domain_file: str, problem_file: str, timeout: int = 300) -> PlanningResult:
         """Call Fast Downward to produce a plan."""
-        workdir = str(Path(domain_file).parent)
+        workdir = str(Path(problem_file).parent)
         cmd = ["python3", FAST_DOWNWARD_PY, domain_file, problem_file, "--search", "astar(lmcut())"]
         self.get_logger().info(f"Calling Fast Downward: {' '.join(cmd)} (workdir={workdir})")
         try:
@@ -888,6 +977,153 @@ Current Planner Domain:
             if ln:
                 lines.append(ln)
         return lines
+
+    def _parse_planning_json(self, text: str) -> Optional[Dict[str, Any]]:
+        """Parse LLM output into planning data dict following data.json structure."""
+        if not text:
+            return None
+
+        def _parse_predicate_text_list(items: Any, field_name: str) -> Optional[List[Dict[str, Any]]]:
+            if items is None:
+                return []
+            if not isinstance(items, list):
+                self.get_logger().error(f"JSON field '{field_name}' must be a list when provided")
+                return None
+
+            parsed_items: List[Dict[str, Any]] = []
+            for item in items:
+                # Preferred format: "predicate arg1 arg2"
+                if isinstance(item, str):
+                    raw = " ".join(item.split())
+                    if not raw:
+                        continue
+                    parts = raw.split(" ")
+                    parsed_items.append({
+                        "predicate": parts[0],
+                        "args": parts[1:],
+                    })
+                    continue
+
+                # Backward compatibility: {"predicate": "...", "args": [...]}
+                if isinstance(item, dict):
+                    predicate = item.get("predicate")
+                    args = item.get("args", [])
+                    if predicate is None or not isinstance(args, list):
+                        continue
+                    pred_name = str(predicate).strip()
+                    if not pred_name:
+                        continue
+                    parsed_items.append({
+                        "predicate": pred_name,
+                        "args": [str(arg).strip() for arg in args if str(arg).strip()]
+                    })
+            return parsed_items
+
+        def _try_load(candidate: str) -> Optional[Dict[str, Any]]:
+            try:
+                return json.loads(candidate)
+            except Exception:
+                return None
+
+        text_stripped = text.strip()
+        json_candidates = []
+
+        # Prefer fenced json blocks if present
+        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text_stripped, re.DOTALL)
+        if fenced:
+            json_candidates.append(fenced.group(1))
+
+        # Raw text as-is
+        json_candidates.append(text_stripped)
+
+        # Largest brace-wrapped span fallback
+        brace_start = text_stripped.find("{")
+        brace_end = text_stripped.rfind("}")
+        if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
+            json_candidates.append(text_stripped[brace_start:brace_end + 1])
+
+        parsed: Optional[Dict[str, Any]] = None
+        for candidate in json_candidates:
+            parsed = _try_load(candidate)
+            if isinstance(parsed, dict):
+                break
+
+        if not isinstance(parsed, dict):
+            self.get_logger().error("Failed to parse LLM JSON output")
+            return None
+
+        base_data = parsed.get("data", parsed)
+        if not isinstance(base_data, dict):
+            self.get_logger().error("Parsed JSON missing 'data' object")
+            return None
+        
+        locations = base_data.get("locations", [])
+        objects = base_data.get("objects", [])
+        goals = base_data.get("goals", [])
+        init = base_data.get("init", [])
+
+    
+        if not isinstance(objects, list) or not isinstance(goals, list) or not isinstance(locations, list):
+            self.get_logger().error("JSON does not contain list fields for objects/goals/locations")
+            return None
+
+        sanitized_locations = [str(loc).strip() for loc in locations if str(loc).strip()]
+        sanitized_objects = [str(obj).strip() for obj in objects if str(obj).strip()]
+
+        sanitized_goals = _parse_predicate_text_list(goals, "goals")
+        if sanitized_goals is None:
+            return None
+
+        sanitized_init = _parse_predicate_text_list(init, "init")
+        if sanitized_init is None:
+            return None
+
+        if not sanitized_objects and not sanitized_goals and not sanitized_locations:
+            self.get_logger().error("Parsed JSON missing objects, goals, and locations")
+            return None
+
+        return {
+            "locations": sanitized_locations,
+            "objects": sanitized_objects,
+            "goals": sanitized_goals,
+            "init": sanitized_init,
+        }
+
+    def _format_predicates(self, predicates: List[Dict[str, Any]]) -> str:
+        """Create a compact string description of predicate list."""
+        parts = []
+        for pred in predicates:
+            name = str(pred.get("predicate", "")).strip()
+            args = pred.get("args", []) or []
+            if not name:
+                continue
+            arg_str = " ".join(str(a).strip() for a in args if str(a).strip())
+            parts.append(f"{name} {arg_str}".strip())
+        return "; ".join(parts) if parts else "unknown"
+
+    def _get_template_problem_path(self) -> str:
+        if self.domain_mode == "blocksworld":
+            return TEMPLATE_PROBLEM_BLOCKSWORLD
+        if self.domain_mode == "gripper":
+            return TEMPLATE_PROBLEM_GRIPPER
+        return TEMPLATE_PROBLEM
+
+    def _get_domain_pddl_path(self) -> str:
+        if self.domain_mode == "blocksworld":
+            return DOMAIN_PDDL_BLOCKSWORLD
+        if self.domain_mode == "gripper":
+            return DOMAIN_PDDL_GRIPPER
+        return DOMAIN_PDDL
+
+    def _compose_step_instruction(self, step_text: str, actions_completed: List[str]) -> str:
+        """Attach workspace context, initial state, and prior steps to the current instruction."""
+        if self.scene_desc_mode == "disabled":
+            workspace = "scene description disabled"
+        else:
+            workspace = self.scene_description or "unknown"
+        initial = self.initial_state_summary or "unknown"
+        completed = "; ".join(actions_completed) if actions_completed else "none"
+        return f"Workspace context: {workspace}\nInitial state: {initial}\nactions completed: {completed}\nInstruction: {step_text}"
 
     # -----------------------
     # Tools
@@ -929,7 +1165,7 @@ Current Planner Domain:
         return tools
 
     # -----------------------
-    # Create PDDL agent
+    # Create Planning Agent
     # -----------------------
     def _build_system_message(self, scene_desc: Optional[str]) -> str:
         include_scene_desc = self.scene_desc_mode != "disabled"
@@ -946,47 +1182,47 @@ Current Planner Domain:
             effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
             scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
 
-        return f"""You are a PDDL domain and problem generator for a robot planning system.
-
-        The current robot state will be provided in the user message.
+        system_message = f"""You are a planning assistant for a robot manipulation system.
 
         {scene_section}
 
-        Below is a TEMPLATE DOMAIN with predefined actions. You should use this as a starting point:
+        Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
+        {{{{
+            "data": {{{{
+                "locations": ["left-of-gear"],
+                "objects": ["gear", "bolt"],
+                "goals": ["gripper-close"]
+            }}}}
+        }}}}
+        Where
+        - locations are task-specific locations needed to complete the instruction.
+        - objects are the objects present in the workspace
+        - goals are the desired FINAL state.
+        - Each predicate in goals/init must be a single string with space-separated tokens, e.g. "object-at-location gear handover"
+        DO NOT put intermediate goals in the goals list.
+        - If the user ask to "handover" or "hand me" an object, the requested object should be located at handover
 
-        {FIXED_DOMAIN_DEFAULT}
+        Requirements:
+        - Always return the JSON structure above (objects list, goals list). Lengths may vary.
+        - Object names CANNOT contain spaces, use underscore
+        - Do not wrap the JSON in Markdown fences.
+        - You can add modifiers to the object name, like screwdriver_leftmost, so you DO NOT need to ask clarifying questions
+        - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
+        - You may call tools like vqa if needed, but the final reply must still be the JSON described.
 
-        Your task is to:
-        1. Review the template domain above
-        2. Modify it ONLY if necessary (for example, if additional typing constraints are required)
-        3. Generate a corresponding PROBLEM file with:
-        - Object definitions (include directions: left, right, up, down, forward, backward as direction objects)
-        - Initial state based on provided robot state and scene context
-        - Goal state that achieves the user's instruction
-
-        IMPORTANT GUIDELINES:
-        - If the instruction is unclear, respond with a clarifying question.
-        - When responding with a clarifying question, prefix the entire response with NORMAL and include only the question.
-        - You have access to vision tools like vqa to inspect the scene.
-        - Use vqa when instruction refers to spatial ambiguity (for example: leftmost object).
-        - Remember PDDL uses the closed-world assumption.
-        - When instructed to hand over an object, the goal should place the robot at handover while holding that object.
-        - Prefer the unmodified template whenever possible.
-
-        Follow this format exactly for planning responses:
-        REASONING:
-        [Explain your approach and any domain modifications]
-
-        DOMAIN:
-        ```pddl
-        [domain content - use template or minimally modified version]
-        ```
-
-        PROBLEM:
-        ```pddl
-        [problem content]
-        ```
+        Predicate hints:
+        - DO NOT create new predicates
+        - gripper-open: args []
+        - gripper-close: args []
+        - robot-at-location: args [location_name]
+        - robot-at-object: args [object_name]
+        - object-at-location: args [object_name, location_name]
+        - robot-have: args [object_name]
+        - Available locations: home, ready, handover
         """
+
+        return system_message
+
 
     def _build_blocksworld_system_message(self, scene_desc: Optional[str], include_scene_desc: bool) -> str:
         scene_section = ""
@@ -994,38 +1230,41 @@ Current Planner Domain:
             effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
             scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
 
-        return f"""You are a PDDL domain and problem generator for the classic Blocksworld domain.
+        system_message = f"""You are a planning assistant for a robot manipulation system.
 
         {scene_section}
 
-        Below is the TEMPLATE DOMAIN to use:
+        Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
+        {{{{
+            "data": {{{{
+                "objects": ["b", "g", "p"],
+                "init": ["arm-empty", "on-table b", "on g b", "on-table p"],
+                "goals": ["on-table b", "on g b", "on p g"],
+            }}}}
+        }}}}
+        Where
+        - objects are the objects present in the workspace
+        - init are the CURRENT state predicates
+        - goals are the desired FINAL state.
+        - Each predicate in goals/init must be a single string with space-separated tokens, e.g. "on p g"
 
-        {FIXED_DOMAIN_BLOCKSWORLD}
+        Requirements:
+        - ALWAYS return the JSON structure above following the schema (objects list, goals list) EXACTLY. Lengths may vary.
+        - Object names CANNOT contain spaces, use underscore
+        - Colored blocks are represented by their color initial in lowercase: r=red, g=green, b=blue, y=yellow, p=purple
+        - Follow the instruction even if there are inconsistencies with the initial state (e.g. if the user says "place the red block on the table" but there is no red block in the initial state, you can still include "red_block" in the objects and goals as needed to fulfill the instruction)
+        - Do not wrap the JSON in Markdown fences.
 
-        Your task is to:
-        1. Keep the Blocksworld domain unchanged unless there is a strict formatting reason to adjust spacing.
-        2. Generate a PROBLEM file that captures current state and target arrangement.
-
-        IMPORTANT GUIDELINES:
-        - Use only these predicates: clear, on-table, arm-empty, holding, on.
-        - Do not invent new predicates or actions.
-        - Include arm-empty in init when the arm is not holding a block.
-        - If unclear, ask a clarifying question prefixed with NORMAL and nothing else.
-
-        Follow this format exactly:
-        REASONING:
-        [Short reasoning]
-
-        DOMAIN:
-        ```pddl
-        [domain content]
-        ```
-
-        PROBLEM:
-        ```pddl
-        [problem content]
-        ```
+        Predicate hints:
+        - DO NOT create new predicates
+        - clear: args [object_name] — if the object has nothing on top of it (alone or top of a stack), you MUST include clear
+        - on-table: args [object_name] — the object is resting directly on the table surface
+        - arm-empty: args [] — the robot arm is not holding any object, this is ALWAYS true for the initial state
+        - holding: args [object_name] — the robot arm is currently grasping the specified object
+        - on: args [object_name, object_name] — the first object is stacked directly on top of the second object
         """
+
+        return system_message
 
     def _build_gripper_system_message(self, scene_desc: Optional[str], include_scene_desc: bool) -> str:
         scene_section = ""
@@ -1033,44 +1272,47 @@ Current Planner Domain:
             effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
             scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
 
-        return f"""You are a PDDL domain and problem generator for the classic Gripper domain.
+        system_message = f"""You are a planning assistant for a robot manipulation system.
 
         {scene_section}
 
-        Below is the TEMPLATE DOMAIN to use:
+        Your job: analyze the user's instruction and output planning data as VALID JSON ONLY (no prose, no Markdown) following this shape:
+        {{{{
+            "data": {{{{
+                "objects": ["roomA", "roomB", "Ball1", "Ball2", "left", "right"],
+                "init": ["room roomA", "room roomB", "ball Ball1", "ball Ball2", "gripper left", "gripper right", "at-robby roomA", "free left", "free right", "at Ball1 roomA", "at Ball2 roomA"],
+                "goals": ["at Ball1 roomB", "at Ball2 roomB"]
+            }}}}
+        }}}}
+        Where
+        - objects are the ball, gripper, and room present in the problem
+        - init are the CURRENT state predicates
+        - goals are the desired FINAL state.
+        - Each predicate in goals/init must be a single string with space-separated tokens, e.g. "at Ball1 roomB"
 
-        {FIXED_DOMAIN_GRIPPER}
+        Requirements:
+        - Always return the JSON structure above (objects list, goals list). Lengths may vary.
+        - Object names CANNOT contain spaces, use underscore
+        - Do not wrap the JSON in Markdown fences.
 
-        Your task is to:
-        1. Keep the Gripper domain unchanged unless there is a strict formatting reason to adjust spacing.
-        2. Generate a PROBLEM file with rooms, balls, grippers, initial state, and goals.
-
-        IMPORTANT GUIDELINES:
-        - Use only these predicates: room, ball, gripper, at-robby, at, free, carry.
-        - Use init facts for type declarations (room, ball, gripper).
-        - Do not invent new predicates or actions.
-        - If unclear, ask a clarifying question prefixed with NORMAL and nothing else.
-
-        Follow this format exactly:
-        REASONING:
-        [Short reasoning]
-
-        DOMAIN:
-        ```pddl
-        [domain content]
-        ```
-
-        PROBLEM:
-        ```pddl
-        [problem content]
-        ```
+        Predicate hints:
+        - DO NOT create new predicates
+        - room: args [room_name] — declares that the argument is a room (type declaration)
+        - ball: args [ball_name] — declares that the argument is a ball (type declaration)
+        - gripper: args [gripper_name] — declares that the argument is a gripper (type declaration)
+        - at-robby: args [room_name] — the robot is currently located in the specified room
+        - at: args [ball_name, room_name] — the specified ball is currently located in the specified room
+        - free: args [gripper_name] — the specified gripper is not holding any object and is available to pick up
+        - carry: args [object_name, gripper_name] — the specified gripper is currently holding the specified object
         """
 
+        return system_message
+
     def _create_pddl_agent_executor(self, scene_desc: Optional[str] = None) -> AgentExecutor:
-        """Create an agent that generates PDDL domain and problem files."""
+        """Create an agent that generates planning data (objects and goals) in JSON format using structured output."""
         if scene_desc is None:
             with self._init_lock:
-                scene_desc = self.scene_description if self.scene_description else "Scene not yet analyzed"
+                scene_desc = self.scene_description
 
         system_message = self._build_system_message(scene_desc)
 
@@ -1080,7 +1322,13 @@ Current Planner Domain:
             ("human", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
-        agent = create_tool_calling_agent(self.llm, self.tools, prompt)
+        
+        agent = create_tool_calling_agent(
+            llm=self.llm,
+            tools=self.tools,
+            prompt=prompt,
+        )
+
         return AgentExecutor(agent=agent, tools=self.tools, verbose=True, max_iterations=12)
 
     # -----------------------
@@ -1110,7 +1358,12 @@ Current Planner Domain:
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
 
         feedback_msg = self.high_level_action_type.Feedback()
-        result_container: Dict[str, Any] = {"success": False, "final_response": ""}
+        result_container: Dict[str, Any] = {
+            "success": False,
+            "final_response": "",
+            "input_token": 0,
+            "output_token": 0,
+        }
 
         def run_pipeline():
             try:
@@ -1124,11 +1377,13 @@ Current Planner Domain:
 
                 request_scene_desc = getattr(goal_handle.request, "scene_desc", None)
                 self.get_logger().info(f"Scene description attached to request: {request_scene_desc}")
-                steps = self._generate_plan(
+                steps, input_token, output_token = self._generate_plan(
                     goal_text,
                     start_time=self.start_time,
                     request_scene_desc=request_scene_desc,
                 )
+                result_container["input_token"] = int(input_token)
+                result_container["output_token"] = int(output_token)
                 if not steps:
                     result_container["success"] = False
                     result_container["final_response"] = "Failed to generate plan"
@@ -1166,6 +1421,10 @@ Current Planner Domain:
         result_msg = self.high_level_action_type.Result()
         result_msg.success = bool(result_container.get("success", False))
         result_msg.final_response = str(result_container.get("final_response", ""))
+        if hasattr(result_msg, "input_token"):
+            result_msg.input_token = int(result_container.get("input_token", 0))
+        if hasattr(result_msg, "output_token"):
+            result_msg.output_token = int(result_container.get("output_token", 0))
 
         goal_handle.succeed()
         self.get_logger().info(f"[high-level action] Goal finished. success={result_msg.success}")
