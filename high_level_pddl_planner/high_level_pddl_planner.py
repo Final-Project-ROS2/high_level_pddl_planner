@@ -992,7 +992,7 @@ Current Planner Domain:
         scene_section = ""
         if include_scene_desc:
             effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
-            scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
+            scene_section = f"\nThe initial state is: {effective_scene_desc}\n"
 
         return f"""You are a PDDL domain and problem generator for the classic Blocksworld domain.
 
