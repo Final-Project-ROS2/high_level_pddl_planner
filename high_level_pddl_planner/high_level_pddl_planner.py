@@ -12,7 +12,7 @@ import threading
 import time
 import subprocess
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
@@ -24,6 +24,10 @@ from std_msgs.msg import String
 from geometry_msgs.msg import Pose
 
 from custom_interfaces.action import Prompt, PromptScene
+try:
+    from custom_interfaces.action import PromptSceneToken
+except ImportError:
+    PromptSceneToken = None
 from custom_interfaces.srv import (
     DetectObjects,
     ClassifyBBox,
@@ -34,6 +38,7 @@ from custom_interfaces.srv import (
 )
 
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool, tool
 from langchain.agents import AgentExecutor, create_tool_calling_agent
@@ -83,6 +88,62 @@ class PlanningResult:
         self.stderr = stderr
         self.plan = plan
         self.plan_length = len([l for l in plan.splitlines() if l.strip()])
+
+
+class OllamaTokenUsageTracker(BaseCallbackHandler):
+    """Aggregate prompt/completion token usage across all LLM calls in one agent run."""
+
+    def __init__(self):
+        super().__init__()
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    @staticmethod
+    def _to_int(value: Any) -> int:
+        try:
+            if value is None:
+                return 0
+            return max(0, int(value))
+        except Exception:
+            return 0
+
+    def on_llm_end(self, response, **kwargs) -> None:
+        llm_output = getattr(response, "llm_output", {}) or {}
+        token_usage = llm_output.get("token_usage") or llm_output.get("usage") or {}
+
+        input_tokens = self._to_int(
+            token_usage.get("prompt_tokens") or token_usage.get("input_tokens")
+        )
+        output_tokens = self._to_int(
+            token_usage.get("completion_tokens") or token_usage.get("output_tokens")
+        )
+        if input_tokens or output_tokens:
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
+            return
+
+        for generation_list in getattr(response, "generations", []) or []:
+            for generation in generation_list:
+                msg = getattr(generation, "message", None)
+                if msg is None:
+                    continue
+
+                usage_metadata = getattr(msg, "usage_metadata", None) or {}
+                input_tokens = self._to_int(
+                    usage_metadata.get("input_tokens") or usage_metadata.get("prompt_tokens")
+                )
+                output_tokens = self._to_int(
+                    usage_metadata.get("output_tokens") or usage_metadata.get("completion_tokens")
+                )
+                if input_tokens or output_tokens:
+                    self.input_tokens += input_tokens
+                    self.output_tokens += output_tokens
+                    continue
+
+                # Ollama typically returns these counters.
+                response_metadata = getattr(msg, "response_metadata", None) or {}
+                self.input_tokens += self._to_int(response_metadata.get("prompt_eval_count"))
+                self.output_tokens += self._to_int(response_metadata.get("eval_count"))
 
 
 class Ros2HighLevelAgentNode(Node):
@@ -169,7 +230,18 @@ class Ros2HighLevelAgentNode(Node):
         self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
         self.reset_state_srv = self.create_service(Trigger, "/reset_state", self.reset_state_callback)
 
-        self.high_level_action_type = PromptScene if self.scene_desc_mode == "custom" else Prompt
+        if self.use_ollama and PromptSceneToken is not None:
+            self.high_level_action_type = PromptSceneToken
+        elif self.scene_desc_mode == "custom":
+            self.high_level_action_type = PromptScene
+        else:
+            self.high_level_action_type = Prompt
+
+        if self.use_ollama and PromptSceneToken is None:
+            self.get_logger().warn(
+                "PromptSceneToken action interface is not available. "
+                "Falling back to existing high-level action interfaces without token fields."
+            )
 
         self._action_server = ActionServer(
             self,
@@ -469,12 +541,18 @@ class Ros2HighLevelAgentNode(Node):
         instruction_text: str,
         start_time: Optional[float] = None,
         request_scene_desc: Optional[str] = None,
-    ) -> List[str]:
+    ) -> Tuple[List[str], int, int]:
         """Generate a plan using fixed domain and dynamic problem generation."""
+        # Make blocksworld/gripper runs stateless by dropping any prior turns
+        if self.domain_mode != "default":
+            self.chat_history.clear()
         self.chat_history.append({"role": "user", "content": instruction_text})
 
         with self._tools_called_lock:
             self._tools_called = []
+
+        input_token_count = 0
+        output_token_count = 0
 
         try:
             self.get_logger().info("High-level agent (PDDL): generating plan with fixed domain...")
@@ -538,13 +616,45 @@ class Ros2HighLevelAgentNode(Node):
                     langchain_history.append(AIMessage(content=msg["content"]))
 
             # Invoke agent with instruction only (state will be in init block)
-            agent_resp = self.agent_executor.invoke({
+            invoke_payload = {
                 "input": instruction_text,
-                "chat_history": langchain_history
-            })
+                "chat_history": langchain_history,
+            }
+
+            token_tracker: Optional[OllamaTokenUsageTracker] = None
+            if self.use_ollama:
+                token_tracker = OllamaTokenUsageTracker()
+                try:
+                    agent_resp = self.agent_executor.invoke(
+                        invoke_payload,
+                        config={"callbacks": [token_tracker]},
+                    )
+                except TypeError:
+                    # Compatibility with older LangChain invoke signatures.
+                    agent_resp = self.agent_executor.invoke(
+                        invoke_payload,
+                        callbacks=[token_tracker],
+                    )
+            else:
+                agent_resp = self.agent_executor.invoke(invoke_payload)
 
             final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
             self.get_logger().info(f"Agent output (raw):\n{final_text}")
+
+            if token_tracker is not None:
+                input_token_count = int(token_tracker.input_tokens)
+                output_token_count = int(token_tracker.output_tokens)
+
+                if input_token_count <= 0:
+                    input_token_count = self._estimate_token_count(
+                        instruction_text + "\n" + "\n".join(m["content"] for m in self.chat_history[:-1])
+                    )
+                if output_token_count <= 0:
+                    output_token_count = self._estimate_token_count(final_text)
+
+                self.get_logger().info(
+                    f"Ollama token usage: input={input_token_count}, output={output_token_count}"
+                )
 
             # If the agent is asking a clarifying question (prefixed with NORMAL), just relay it
             final_text_stripped = final_text.strip()
@@ -555,7 +665,7 @@ class Ros2HighLevelAgentNode(Node):
                 self.chat_history.append({"role": "assistant", "content": clarification})
                 self.response_pub.publish(String(data=clarification))
                 self.tts_pub.publish(String(data=self._format_for_tts(clarification)))
-                return []
+                return [], input_token_count, output_token_count
 
             self.chat_history.append({"role": "assistant", "content": final_text})
 
@@ -568,7 +678,7 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().error("LLM response could not be parsed into planning JSON.")
                 self.response_pub.publish(String(data=msg))
                 self.tts_pub.publish(String(data=self._format_for_tts(msg)))
-                return []
+                return [], input_token_count, output_token_count
 
             if self.domain_mode != "default":
                 init_predicates = planning_payload.get("init", [])
@@ -611,7 +721,7 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().error("Transform failed or problem file not created.")
                 self.response_pub.publish(String(data=msg))
                 self.tts_pub.publish(String(data="Failed to generate the planning file. Please try again."))
-                return []
+                return [], input_token_count, output_token_count
 
             self.get_logger().debug(f"Problem:\n{problem_path.read_text()}")
 
@@ -631,7 +741,7 @@ class Ros2HighLevelAgentNode(Node):
                 self.response_pub.publish(String(data=msg))
                 self.tts_pub.publish(String(data="I couldn't find a valid plan for that request. Could you try rephrasing it?"))
                 # Keep last_goal_state intact - planning failed but state hasn't changed
-                return []
+                return [], input_token_count, output_token_count
 
             self.get_logger().info("Plan obtained from Fast Downward. Parsing to steps...")
             plan_lines = self._parse_plan_text(plan_result.plan)
@@ -641,7 +751,7 @@ class Ros2HighLevelAgentNode(Node):
                 self.response_pub.publish(String(data=msg))
                 self.tts_pub.publish(String(data="I couldn't parse the plan into steps. Please try again."))
                 # Keep last_goal_state intact - parsing failed but state hasn't changed
-                return []
+                return [], input_token_count, output_token_count
 
             self.latest_plan = plan_lines
 
@@ -702,14 +812,27 @@ class Ros2HighLevelAgentNode(Node):
                 execution_thread = threading.Thread(target=execute_plan, daemon=True)
                 execution_thread.start()
 
-            return plan_lines
+            return plan_lines, input_token_count, output_token_count
 
         except Exception as e:
             self.get_logger().error(f"Error generating plan: {e}")
             self.response_pub.publish(String(data="Sorry, something went wrong while planning."))
             self.tts_pub.publish(String(data="Sorry, something went wrong. Please try again."))
             # Keep last_goal_state intact - planning exception but state hasn't changed
-            return []
+            return [], input_token_count, output_token_count
+
+    def _estimate_token_count(self, text: str) -> int:
+        """Best-effort token estimate when provider token metadata is unavailable."""
+        if not text:
+            return 0
+        try:
+            if hasattr(self.llm, "get_num_tokens"):
+                count = self.llm.get_num_tokens(text)
+                if isinstance(count, int) and count >= 0:
+                    return count
+        except Exception:
+            pass
+        return len(text.split())
 
     def confirm_service_callback(self, request, response):
         """Execute the latest plan when confirmed."""
@@ -860,6 +983,42 @@ class Ros2HighLevelAgentNode(Node):
         if not text:
             return None
 
+        def _parse_predicate_text_list(items: Any, field_name: str) -> Optional[List[Dict[str, Any]]]:
+            if items is None:
+                return []
+            if not isinstance(items, list):
+                self.get_logger().error(f"JSON field '{field_name}' must be a list when provided")
+                return None
+
+            parsed_items: List[Dict[str, Any]] = []
+            for item in items:
+                # Preferred format: "predicate arg1 arg2"
+                if isinstance(item, str):
+                    raw = " ".join(item.split())
+                    if not raw:
+                        continue
+                    parts = raw.split(" ")
+                    parsed_items.append({
+                        "predicate": parts[0],
+                        "args": parts[1:],
+                    })
+                    continue
+
+                # Backward compatibility: {"predicate": "...", "args": [...]}
+                if isinstance(item, dict):
+                    predicate = item.get("predicate")
+                    args = item.get("args", [])
+                    if predicate is None or not isinstance(args, list):
+                        continue
+                    pred_name = str(predicate).strip()
+                    if not pred_name:
+                        continue
+                    parsed_items.append({
+                        "predicate": pred_name,
+                        "args": [str(arg).strip() for arg in args if str(arg).strip()]
+                    })
+            return parsed_items
+
         def _try_load(candidate: str) -> Optional[Dict[str, Any]]:
             try:
                 return json.loads(candidate)
@@ -908,38 +1067,16 @@ class Ros2HighLevelAgentNode(Node):
             self.get_logger().error("JSON does not contain list fields for objects/goals/locations")
             return None
 
-        if init is not None and not isinstance(init, list):
-            self.get_logger().error("JSON field 'init' must be a list when provided")
-            return None
-
         sanitized_locations = [str(loc).strip() for loc in locations if str(loc).strip()]
         sanitized_objects = [str(obj).strip() for obj in objects if str(obj).strip()]
 
-        sanitized_goals: List[Dict[str, Any]] = []
-        for goal in goals:
-            if not isinstance(goal, dict):
-                continue
-            predicate = goal.get("predicate")
-            args = goal.get("args", [])
-            if predicate is None or not isinstance(args, list):
-                continue
-            sanitized_goals.append({
-                "predicate": str(predicate).strip(),
-                "args": [str(arg).strip() for arg in args]
-            })
+        sanitized_goals = _parse_predicate_text_list(goals, "goals")
+        if sanitized_goals is None:
+            return None
 
-        sanitized_init: List[Dict[str, Any]] = []
-        for init_predicate in init or []:
-            if not isinstance(init_predicate, dict):
-                continue
-            predicate = init_predicate.get("predicate")
-            args = init_predicate.get("args", [])
-            if predicate is None or not isinstance(args, list):
-                continue
-            sanitized_init.append({
-                "predicate": str(predicate).strip(),
-                "args": [str(arg).strip() for arg in args]
-            })
+        sanitized_init = _parse_predicate_text_list(init, "init")
+        if sanitized_init is None:
+            return None
 
         if not sanitized_objects and not sanitized_goals and not sanitized_locations:
             self.get_logger().error("Parsed JSON missing objects, goals, and locations")
@@ -1054,13 +1191,14 @@ class Ros2HighLevelAgentNode(Node):
             "data": {{{{
                 "locations": ["left-of-gear"],
                 "objects": ["gear", "bolt"],
-                "goals": [{{{{"predicate": "gripper-close", "args": []}}}}]
+                "goals": ["gripper-close"]
             }}}}
         }}}}
         Where
         - locations are task-specific locations needed to complete the instruction.
         - objects are the objects present in the workspace
         - goals are the desired FINAL state.
+        - Each predicate in goals/init must be a single string with space-separated tokens, e.g. "object-at-location gear handover"
         DO NOT put intermediate goals in the goals list.
         - If the user ask to "handover" or "hand me" an object, the requested object should be located at handover
 
@@ -1100,14 +1238,15 @@ class Ros2HighLevelAgentNode(Node):
         {{{{
             "data": {{{{
                 "objects": ["b", "g", "p"],
-                "init": [{{{{"predicate": "arm-empty", "args": []}}}}, {{{{"predicate": "on-table", "args": ["b"]}}}}, {{{{"predicate": "on", "args": ["g", "b"]}}}}, {{{{"predicate": "on-table", "args": ["p"]}}}}],
-                "goals": [{{{{"predicate": "on-table", "args": ["b"]}}}}, {{{{"predicate": "on", "args": ["g", "b"]}}}}, {{{{"predicate": "on", "args": ["p", "g"]}}}}],
+                "init": ["arm-empty", "on-table b", "on g b", "on-table p"],
+                "goals": ["on-table b", "on g b", "on p g"],
             }}}}
         }}}}
         Where
         - objects are the objects present in the workspace
         - init are the CURRENT state predicates
         - goals are the desired FINAL state.
+        - Each predicate in goals/init must be a single string with space-separated tokens, e.g. "on p g"
 
         Requirements:
         - ALWAYS return the JSON structure above following the schema (objects list, goals list) EXACTLY. Lengths may vary.
@@ -1141,14 +1280,15 @@ class Ros2HighLevelAgentNode(Node):
         {{{{
             "data": {{{{
                 "objects": ["roomA", "roomB", "Ball1", "Ball2", "left", "right"],
-                "init": [{{{{"predicate": "room", "args": ["roomA"]}}}}, {{{{"predicate": "room", "args": ["roomB"]}}}}, {{{{"predicate": "ball", "args": ["Ball1"]}}}}, {{{{"predicate": "ball", "args": ["Ball2"]}}}}, {{{{"predicate": "gripper", "args": ["left"]}}}}, {{{{"predicate": "gripper", "args": ["right"]}}}}, {{{{"predicate": "at-robby", "args": ["roomA"]}}}}, {{{{"predicate": "free", "args": ["left"]}}}}, {{{{"predicate": "free", "args": ["right"]}}}}, {{{{"predicate": "at", "args": ["Ball1", "roomA"]}}}}, {{{{"predicate": "at", "args": ["Ball2", "roomA"]}}}}],
-                "goals": [{{{{"predicate": "at", "args": ["Ball1", "roomB"]}}}}, {{{{"predicate": "at", "args": ["Ball2", "roomB"]}}}}]
+                "init": ["room roomA", "room roomB", "ball Ball1", "ball Ball2", "gripper left", "gripper right", "at-robby roomA", "free left", "free right", "at Ball1 roomA", "at Ball2 roomA"],
+                "goals": ["at Ball1 roomB", "at Ball2 roomB"]
             }}}}
         }}}}
         Where
         - objects are the ball, gripper, and room present in the problem
         - init are the CURRENT state predicates
         - goals are the desired FINAL state.
+        - Each predicate in goals/init must be a single string with space-separated tokens, e.g. "at Ball1 roomB"
 
         Requirements:
         - Always return the JSON structure above (objects list, goals list). Lengths may vary.
@@ -1218,7 +1358,12 @@ class Ros2HighLevelAgentNode(Node):
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
 
         feedback_msg = self.high_level_action_type.Feedback()
-        result_container: Dict[str, Any] = {"success": False, "final_response": ""}
+        result_container: Dict[str, Any] = {
+            "success": False,
+            "final_response": "",
+            "input_token": 0,
+            "output_token": 0,
+        }
 
         def run_pipeline():
             try:
@@ -1232,11 +1377,13 @@ class Ros2HighLevelAgentNode(Node):
 
                 request_scene_desc = getattr(goal_handle.request, "scene_desc", None)
                 self.get_logger().info(f"Scene description attached to request: {request_scene_desc}")
-                steps = self._generate_plan(
+                steps, input_token, output_token = self._generate_plan(
                     goal_text,
                     start_time=self.start_time,
                     request_scene_desc=request_scene_desc,
                 )
+                result_container["input_token"] = int(input_token)
+                result_container["output_token"] = int(output_token)
                 if not steps:
                     result_container["success"] = False
                     result_container["final_response"] = "Failed to generate plan"
@@ -1274,6 +1421,10 @@ class Ros2HighLevelAgentNode(Node):
         result_msg = self.high_level_action_type.Result()
         result_msg.success = bool(result_container.get("success", False))
         result_msg.final_response = str(result_container.get("final_response", ""))
+        if hasattr(result_msg, "input_token"):
+            result_msg.input_token = int(result_container.get("input_token", 0))
+        if hasattr(result_msg, "output_token"):
+            result_msg.output_token = int(result_container.get("output_token", 0))
 
         goal_handle.succeed()
         self.get_logger().info(f"[high-level action] Goal finished. success={result_msg.success}")
