@@ -856,7 +856,7 @@ Current Planner Domain:
 
     def _run_fast_downward(self, domain_file: str, problem_file: str, timeout: int = 300) -> PlanningResult:
         """Call Fast Downward to produce a plan."""
-        workdir = str(Path(domain_file).parent)
+        workdir = "/home/group11/final_project_ws/src/high_level_pddl_planner/"
         cmd = ["python3", FAST_DOWNWARD_PY, domain_file, problem_file, "--search", "astar(lmcut())"]
         self.get_logger().info(f"Calling Fast Downward: {' '.join(cmd)} (workdir={workdir})")
         try:
