@@ -1007,6 +1007,7 @@ Current Planner Domain:
         2. Generate a PROBLEM file that captures current state and target arrangement.
 
         IMPORTANT GUIDELINES:
+        - DO NOT specify the object type, so simply do (:objects r g b) and NOT (:objects r g b - blocks)
         - Use only these predicates: clear, on-table, arm-empty, holding, on.
         - Do not invent new predicates or actions.
         - Include arm-empty in init when the arm is not holding a block.
