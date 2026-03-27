@@ -1108,7 +1108,7 @@ class Ros2HighLevelAgentNode(Node):
         scene_section = ""
         if include_scene_desc:
             effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
-            scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
+            scene_section = f"\nThe initial state is: {effective_scene_desc}\n"
 
         system_message = f"""You are a planning assistant for a robot manipulation system.
 
