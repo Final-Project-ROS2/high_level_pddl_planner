@@ -22,7 +22,7 @@ from std_srvs.srv import SetBool, Trigger
 from std_msgs.msg import String
 from geometry_msgs.msg import Pose
 
-from custom_interfaces.action import Prompt, PromptScene
+from custom_interfaces.action import Prompt, PromptScene, PromptSceneToken
 from custom_interfaces.srv import (
     DetectObjects,
     ClassifyBBox,
@@ -343,10 +343,17 @@ class Ros2HighLevelAgentNode(Node):
         self.chat_history: List[Dict[str, str]] = []
         self.latest_plan: Optional[List[str]] = None
         self.latest_pddl: Optional[PDDLGenerationResult] = None
+        self._last_input_token_estimate = 0
+        self._last_output_token_estimate = 0
 
         self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
 
-        self.high_level_action_type = PromptScene if self.scene_desc_mode == "custom" else Prompt
+        if self.domain_mode == "blocksworld":
+            self.high_level_action_type = PromptSceneToken
+        elif self.scene_desc_mode == "custom":
+            self.high_level_action_type = PromptScene
+        else:
+            self.high_level_action_type = Prompt
 
         self._action_server = ActionServer(
             self,
@@ -397,6 +404,11 @@ class Ros2HighLevelAgentNode(Node):
         self.benchmark_pub.publish(
             String(data=f"{label},{t_sec:.9f}")
         )
+
+    def _estimate_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return max(1, len(text) // 4)
     
     def _initialize_scene_description(self):
         """
@@ -582,6 +594,9 @@ class Ros2HighLevelAgentNode(Node):
         request_scene_desc: Optional[str] = None,
     ) -> List[str]:
         """Generate a plan using fixed domain and dynamic problem generation."""
+        self._last_input_token_estimate = 0
+        self._last_output_token_estimate = 0
+
         if not self.use_chat_history:
             # Stateless operation for classic domains: treat every request independently.
             self.chat_history.clear()
@@ -596,6 +611,7 @@ class Ros2HighLevelAgentNode(Node):
             self.response_pub.publish(String(data="Got it! Let me think through that..."))
             self.response_pub.publish(String(data="Analyzing scene and determining current state"))
 
+            active_scene_desc: Optional[str]
             if self.scene_desc_mode == "custom":
                 scene_from_request = (request_scene_desc or "").strip()
                 if not scene_from_request:
@@ -607,14 +623,20 @@ class Ros2HighLevelAgentNode(Node):
                     self.scene_description = scene_from_request
                 self.get_logger().info(f"scene_desc=custom: using scene description from request: {scene_from_request}")
                 self.agent_executor = self._create_pddl_agent_executor(scene_desc=scene_from_request)
+                active_scene_desc = scene_from_request
             elif self.scene_desc_mode == "disabled":
                 self.scene_description = None
                 if self.agent_executor is None:
                     self.agent_executor = self._create_pddl_agent_executor(scene_desc=None)
+                active_scene_desc = None
             elif self.agent_executor is None:
                 with self._init_lock:
                     current_scene = self.scene_description
                 self.agent_executor = self._create_pddl_agent_executor(scene_desc=current_scene)
+                active_scene_desc = current_scene
+            else:
+                with self._init_lock:
+                    active_scene_desc = self.scene_description
 
             if self.agent_executor is None:
                 raise RuntimeError("Agent executor is not initialized")
@@ -651,6 +673,15 @@ Current Planner Domain:
             # Create augmented instruction with state info
             augmented_instruction = f"{instruction_text}\n\n{state_description}" if state_description else instruction_text
 
+            system_prompt_text = self._build_system_message(active_scene_desc)
+            history_texts = []
+            for msg in langchain_history:
+                role = "user" if isinstance(msg, HumanMessage) else "assistant"
+                history_texts.append(f"{role}: {msg.content}")
+            input_text_parts = [system_prompt_text, f"user: {augmented_instruction}"]
+            input_text_parts.extend(history_texts)
+            self._last_input_token_estimate = self._estimate_tokens("\n".join(input_text_parts))
+
             # Invoke agent
             agent_resp = self.agent_executor.invoke({
                 "input": augmented_instruction,
@@ -658,6 +689,7 @@ Current Planner Domain:
             })
 
             final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
+            self._last_output_token_estimate = self._estimate_tokens(final_text)
             self.get_logger().info(f"Agent output (raw):\n{final_text}")
 
             # If the agent is asking a clarifying question (prefixed with NORMAL), just relay it
@@ -1111,7 +1143,12 @@ Current Planner Domain:
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
 
         feedback_msg = self.high_level_action_type.Feedback()
-        result_container: Dict[str, Any] = {"success": False, "final_response": ""}
+        result_container: Dict[str, Any] = {
+            "success": False,
+            "final_response": "",
+            "input_token": 0,
+            "output_token": 0,
+        }
 
         def run_pipeline():
             try:
@@ -1130,6 +1167,8 @@ Current Planner Domain:
                     start_time=self.start_time,
                     request_scene_desc=request_scene_desc,
                 )
+                result_container["input_token"] = self._last_input_token_estimate
+                result_container["output_token"] = self._last_output_token_estimate
                 if not steps:
                     result_container["success"] = False
                     result_container["final_response"] = "Failed to generate plan"
@@ -1142,6 +1181,8 @@ Current Planner Domain:
                 self.get_logger().error(f"Exception in action pipeline: {e}")
                 result_container["success"] = False
                 result_container["final_response"] = f"Error: {e}"
+                result_container["input_token"] = self._last_input_token_estimate
+                result_container["output_token"] = self._last_output_token_estimate
 
         thread = threading.Thread(target=run_pipeline, daemon=True)
         thread.start()
@@ -1167,6 +1208,10 @@ Current Planner Domain:
         result_msg = self.high_level_action_type.Result()
         result_msg.success = bool(result_container.get("success", False))
         result_msg.final_response = str(result_container.get("final_response", ""))
+        if hasattr(result_msg, "input_token"):
+            result_msg.input_token = int(result_container.get("input_token", 0))
+        if hasattr(result_msg, "output_token"):
+            result_msg.output_token = int(result_container.get("output_token", 0))
 
         goal_handle.succeed()
         self.get_logger().info(f"[high-level action] Goal finished. success={result_msg.success}")
