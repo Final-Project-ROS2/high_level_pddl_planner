@@ -23,7 +23,7 @@ from std_srvs.srv import SetBool, Trigger
 from std_msgs.msg import String
 from geometry_msgs.msg import Pose
 
-from custom_interfaces.action import Prompt, PromptScene
+from custom_interfaces.action import Prompt, PromptScene, PromptSceneToken
 from custom_interfaces.srv import (
     DetectObjects,
     ClassifyBBox,
@@ -165,11 +165,16 @@ class Ros2HighLevelAgentNode(Node):
         self.latest_pddl: Optional[PDDLGenerationResult] = None
         self.last_goal_state: Optional[List[Dict[str, Any]]] = None  # Store goal state from previous successful execution
         self.initial_state_summary: Optional[str] = None
+        self._last_input_token_estimate = 0
+        self._last_output_token_estimate = 0
 
         self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
         self.reset_state_srv = self.create_service(Trigger, "/reset_state", self.reset_state_callback)
 
-        self.high_level_action_type = PromptScene if self.scene_desc_mode == "custom" else Prompt
+        if self.domain_mode == "blocksworld":
+            self.high_level_action_type = PromptSceneToken
+        else:
+            self.high_level_action_type = PromptScene if self.scene_desc_mode == "custom" else Prompt
 
         self._action_server = ActionServer(
             self,
@@ -264,6 +269,12 @@ class Ros2HighLevelAgentNode(Node):
         self.benchmark_pub.publish(
             String(data=f"{label},{t_sec:.9f}")
         )
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Simple token estimate using character length (about 4 chars/token)."""
+        if not text:
+            return 0
+        return max(1, len(text) // 4)
     
     def _initialize_scene_description(self):
         """
@@ -471,6 +482,8 @@ class Ros2HighLevelAgentNode(Node):
         request_scene_desc: Optional[str] = None,
     ) -> List[str]:
         """Generate a plan using fixed domain and dynamic problem generation."""
+        self._last_input_token_estimate = 0
+        self._last_output_token_estimate = 0
         # Make blocksworld/gripper runs stateless by dropping any prior turns
         if self.domain_mode != "default":
             self.chat_history.clear()
@@ -540,6 +553,11 @@ class Ros2HighLevelAgentNode(Node):
                 elif msg["role"] == "assistant":
                     langchain_history.append(AIMessage(content=msg["content"]))
 
+            # Estimate input tokens from known LLM input messages.
+            input_text_parts = [self._build_system_message(self.scene_description), instruction_text]
+            input_text_parts.extend([str(m.content) for m in langchain_history if getattr(m, "content", None)])
+            self._last_input_token_estimate = self._estimate_tokens("\n".join(input_text_parts))
+
             # Invoke agent with instruction only (state will be in init block)
             agent_resp = self.agent_executor.invoke({
                 "input": instruction_text,
@@ -547,6 +565,7 @@ class Ros2HighLevelAgentNode(Node):
             })
 
             final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
+            self._last_output_token_estimate = self._estimate_tokens(final_text)
             self.get_logger().info(f"Agent output (raw):\n{final_text}")
 
             # If the agent is asking a clarifying question (prefixed with NORMAL), just relay it
@@ -1239,7 +1258,12 @@ class Ros2HighLevelAgentNode(Node):
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
 
         feedback_msg = self.high_level_action_type.Feedback()
-        result_container: Dict[str, Any] = {"success": False, "final_response": ""}
+        result_container: Dict[str, Any] = {
+            "success": False,
+            "final_response": "",
+            "input_token": 0,
+            "output_token": 0,
+        }
 
         def run_pipeline():
             try:
@@ -1258,6 +1282,8 @@ class Ros2HighLevelAgentNode(Node):
                     start_time=self.start_time,
                     request_scene_desc=request_scene_desc,
                 )
+                result_container["input_token"] = self._last_input_token_estimate
+                result_container["output_token"] = self._last_output_token_estimate
                 if not steps:
                     result_container["success"] = False
                     result_container["final_response"] = "Failed to generate plan"
@@ -1295,6 +1321,10 @@ class Ros2HighLevelAgentNode(Node):
         result_msg = self.high_level_action_type.Result()
         result_msg.success = bool(result_container.get("success", False))
         result_msg.final_response = str(result_container.get("final_response", ""))
+        if hasattr(result_msg, "input_token"):
+            result_msg.input_token = int(result_container.get("input_token", 0))
+        if hasattr(result_msg, "output_token"):
+            result_msg.output_token = int(result_container.get("output_token", 0))
 
         goal_handle.succeed()
         self.get_logger().info(f"[high-level action] Goal finished. success={result_msg.success}")
