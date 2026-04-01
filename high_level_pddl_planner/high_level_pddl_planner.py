@@ -3,6 +3,16 @@ ROS2 High-Level Agent Node (PDDL-based) - Fixed Domain Version
 
 Modified to use a fixed PDDL domain with predetermined actions,
 while generating the problem file dynamically based on runtime state queries.
+
+ROS2 Jazzy fixes applied:
+1. Action client calls (vqa, medium_level, scene init) use threading.Event +
+   add_done_callback so they never re-enter the already-spinning main executor.
+2. Service calls that must block a background thread (_query_state) use a
+   dedicated _StateQueryNode with its own SingleThreadedExecutor running on
+   its own thread. A node can only be owned by one executor at a time, so
+   creating a second lightweight node is the clean solution — it avoids both
+   "Executor is already spinning" and the timeout caused by the main executor
+   not being able to deliver callbacks into a blocking background thread.
 """
 import os
 import re
@@ -15,6 +25,8 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import rclpy
+import rclpy.executors
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.action import ActionServer, ActionClient, CancelResponse, GoalResponse
 from rclpy.task import Future as RclpyFuture
@@ -70,6 +82,69 @@ DOMAIN_PDDL_GRIPPER = os.getenv("DOMAIN_PDDL_GRIPPER", str(PROJECT_ROOT / "domai
 SCENE_DESC_MODES = {"default", "custom", "disabled"}
 DOMAIN_MODES = {"default", "blocksworld", "gripper"}
 
+
+class _StateQueryNode(Node):
+    """
+    Lightweight helper node that owns its own SingleThreadedExecutor and
+    thread. Used exclusively for synchronous-style service calls from
+    background threads in the main node.
+
+    Why a separate node?
+    --------------------
+    In ROS2 Jazzy, a node can only be registered with ONE executor at a time.
+    The main node is already owned by the executor started by rclpy.spin().
+    Calling spin_until_future_complete (or waiting on futures) from a second
+    executor that also owns the main node raises a conflict. By giving these
+    service clients their own node and executor we side-step the issue
+    entirely — no shared ownership, no conflicts.
+
+    Usage
+    -----
+        result = self._state_query_node.call_service(client, request, timeout)
+    """
+
+    def __init__(self):
+        super().__init__("state_query_helper")
+        self._executor = SingleThreadedExecutor()
+        self._executor.add_node(self)
+        self._thread = threading.Thread(target=self._executor.spin, daemon=True)
+        self._thread.start()
+
+    def call_service(self, service_type, service_name: str, request, timeout: float = 3.0):
+        """
+        Create a client on this helper node, call the service, and return
+        the response.  Safe to call from any background thread.
+        """
+        client = self.create_client(service_type, service_name)
+        try:
+            if not client.wait_for_service(timeout_sec=timeout):
+                self.get_logger().warn(f"[StateQueryNode] Service {service_name} unavailable")
+                return None
+
+            future = client.call_async(request)
+
+            # The helper node's executor is already spinning on its own thread,
+            # so the future will be resolved without blocking anyone.
+            done_event = threading.Event()
+
+            def _cb(f):
+                done_event.set()
+
+            future.add_done_callback(_cb)
+
+            if not done_event.wait(timeout=timeout):
+                self.get_logger().warn(f"[StateQueryNode] Timeout calling {service_name}")
+                return None
+
+            return future.result()
+        finally:
+            self.destroy_client(client)
+
+    def destroy(self):
+        self._executor.shutdown()
+        super().destroy_node()
+
+
 class PDDLGenerationResult:
     def __init__(self, json_data: Dict[str, Any]):
         self.json_data = json_data
@@ -121,7 +196,6 @@ class Ros2HighLevelAgentNode(Node):
         # -----------------------------
         if self.use_ollama:
             self.get_logger().info("Using local LLM via Ollama.")
-            # Example: using llama3.1 or any model installed in `ollama list`
             self.llm = ChatOllama(
                 model=self.ollama_model,
                 temperature=0.0
@@ -148,11 +222,10 @@ class Ros2HighLevelAgentNode(Node):
         # Vision clients
         self.vision_vqa_client = ActionClient(self, Prompt, "/vqa")
 
-        # State query service clients
-        self.is_home_client = self.create_client(GetSetBool, "/is_home")
-        self.is_ready_client = self.create_client(GetSetBool, "/is_ready")
-        self.is_handover_client = self.create_client(GetSetBool, "/is_handover")
-        self.gripper_is_open_client = self.create_client(GetSetBool, "/gripper_is_open")
+        # Dedicated helper node for state service queries.
+        # Runs its own executor on its own thread so calls from background
+        # threads never conflict with the main executor. See _StateQueryNode.
+        self._state_query_node = _StateQueryNode()
 
         self._tools_called: List[str] = []
         self._tools_called_lock = threading.Lock()
@@ -223,45 +296,28 @@ class Ros2HighLevelAgentNode(Node):
     def _format_for_tts(self, text: str) -> str:
         """
         Convert text to a format suitable for text-to-speech.
-        - Removes excessive formatting characters
-        - Converts numbered lists to natural language
-        - Simplifies technical jargon
-        - Makes text more conversational
         """
         if not text:
             return ""
-        
-        # Replace multiple newlines with single space
         tts_text = text.replace("\n", " ").replace("\r", " ")
-        
-        # Replace multiple spaces with single space
         tts_text = " ".join(tts_text.split())
-        
-        # Convert numbered list items (e.g., "1. Do X" -> "Step one, do X")
         tts_text = re.sub(r'^\d+\.\s+', lambda m: f"Step {self._number_to_word(int(m.group(0).split('.')[0]))}, ", tts_text)
-        
-        # Remove trailing punctuation that doesn't help TTS (multiple exclamation marks, question marks)
         tts_text = re.sub(r'([!?])\1+', r'\1', tts_text)
-        
-        # Simplify "PDDL" references in speech
         tts_text = tts_text.replace(" PDDL ", " ")
         tts_text = tts_text.replace("PDDL planning", "planning")
-        
         return tts_text.strip()
     
     def _number_to_word(self, num: int) -> str:
-        """Convert a number to its word representation (1-20, and tens)"""
         ones = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
                 "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
                 "seventeen", "eighteen", "nineteen"]
         tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
-        
         if num < 20:
             return ones[num]
         elif num < 100:
             return tens[num // 10] + ("" if num % 10 == 0 else " " + ones[num % 10])
         else:
-            return str(num)  # For larger numbers, just use str representation
+            return str(num)
 
     def _benchmark_log(self, label: str):
         t = self.get_clock().now()
@@ -271,7 +327,6 @@ class Ros2HighLevelAgentNode(Node):
         )
 
     def _estimate_tokens(self, text: str) -> int:
-        """Simple token estimate using character length (about 4 chars/token)."""
         if not text:
             return 0
         return max(1, len(text) // 4)
@@ -350,7 +405,6 @@ class Ros2HighLevelAgentNode(Node):
             result = result_container[0].result
             scene_response = None
             if result is not None:
-                # Extract only the textual response from the action result
                 scene_response = getattr(result, "final_response", None) or str(result)
 
             with self._init_lock:
@@ -377,25 +431,22 @@ class Ros2HighLevelAgentNode(Node):
     # -----------------------
     # State query helpers
     # -----------------------
-    def _query_state(self, client, service_name: str) -> Optional[bool]:
-        """Query a state service and return the current value."""
+    def _query_state(self, service_name: str) -> Optional[bool]:
+        """
+        Query a GetSetBool state service and return its current value.
+
+        Delegates to _StateQueryNode which has its own executor, so this is
+        safe to call from any background thread without touching the main
+        executor.
+        """
         try:
-            if not client.wait_for_service(timeout_sec=3.0):
-                self.get_logger().warn(f"Service {service_name} unavailable")
-                return None
-            
             req = GetSetBool.Request()
-            req.set = False  # Just query, don't set
+            req.set = False
             req.value = False
-            
-            future = client.call_async(req)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
-            
-            resp = future.result()
+            resp = self._state_query_node.call_service(GetSetBool, service_name, req, timeout=3.0)
             if resp is None or not resp.success:
                 self.get_logger().warn(f"Failed to query {service_name}")
                 return None
-            
             return resp.value
         except Exception as e:
             self.get_logger().error(f"Error querying {service_name}: {e}")
@@ -403,20 +454,19 @@ class Ros2HighLevelAgentNode(Node):
 
     def _get_current_state(self) -> Dict[str, bool]:
         """Query all state services and return current state."""
-        state = {}
-        
-        is_home = self._query_state(self.is_home_client, "/is_home")
-        is_ready = self._query_state(self.is_ready_client, "/is_ready")
-        is_handover = self._query_state(self.is_handover_client, "/is_handover")
-        gripper_open = self._query_state(self.gripper_is_open_client, "/gripper_is_open")
-        
-        # Default to reasonable values if services fail
-        state['robot_at_home'] = is_home if is_home is not None else False
-        state['robot_at_ready'] = is_ready if is_ready is not None else False
-        state['robot_in_handover'] = is_handover if is_handover is not None else False
-        state['gripper_open'] = gripper_open if gripper_open is not None else True
+        is_home     = self._query_state("/is_home")
+        is_ready    = self._query_state("/is_ready")
+        is_handover = self._query_state("/is_handover")
+        gripper_open = self._query_state("/gripper_is_open")
+
+        state: Dict[str, bool] = {
+            'robot_at_home':     is_home     if is_home     is not None else False,
+            'robot_at_ready':    is_ready    if is_ready    is not None else False,
+            'robot_in_handover': is_handover if is_handover is not None else False,
+            'gripper_open':      gripper_open if gripper_open is not None else True,
+        }
         state['gripper_close'] = not state['gripper_open']
-        
+
         self.get_logger().info(f"Current state: {state}")
         return state
 
@@ -424,7 +474,6 @@ class Ros2HighLevelAgentNode(Node):
         """Convert current state dict to PDDL init predicates for template."""
         init_predicates = []
         
-        # Add location predicates
         if current_state.get('robot_at_home'):
             init_predicates.append({"predicate": "robot-at-location", "args": ["home"]})
         if current_state.get('robot_at_ready'):
@@ -432,7 +481,6 @@ class Ros2HighLevelAgentNode(Node):
         if current_state.get('robot_in_handover'):
             init_predicates.append({"predicate": "robot-at-location", "args": ["handover"]})
         
-        # Add gripper predicates
         if current_state.get('gripper_open'):
             init_predicates.append({"predicate": "gripper-open", "args": []})
         if current_state.get('gripper_close'):
@@ -484,7 +532,6 @@ class Ros2HighLevelAgentNode(Node):
         """Generate a plan using fixed domain and dynamic problem generation."""
         self._last_input_token_estimate = 0
         self._last_output_token_estimate = 0
-        # Make blocksworld/gripper runs stateless by dropping any prior turns
         if self.domain_mode != "default":
             self.chat_history.clear()
         self.chat_history.append({"role": "user", "content": instruction_text})
@@ -524,16 +571,11 @@ class Ros2HighLevelAgentNode(Node):
 
             init_predicates: List[Dict[str, Any]] = []
             if self.domain_mode == "default":
-                # Get current state from services
                 current_state = self._get_current_state()
-
-                # Convert current state to init predicates for PDDL template
                 init_predicates = self._state_to_init_predicates(current_state)
 
-                # Merge with last goal state if available (continuous state tracking)
                 if self.last_goal_state:
                     self.get_logger().info(f"Merging previous goal state into init: {self.last_goal_state}")
-                    # Add previous goals to init, avoiding duplicates
                     existing_predicates = {(p["predicate"], tuple(p.get("args", []))): p for p in init_predicates}
                     for goal in self.last_goal_state:
                         key = (goal["predicate"], tuple(goal.get("args", [])))
@@ -545,7 +587,6 @@ class Ros2HighLevelAgentNode(Node):
                     f"domain={self.domain_mode}: skipping state service init predicates; expecting init from LLM output."
                 )
 
-            # Build LangChain chat history
             langchain_history = []
             for msg in self.chat_history[:-1]:
                 if msg["role"] == "user":
@@ -553,12 +594,10 @@ class Ros2HighLevelAgentNode(Node):
                 elif msg["role"] == "assistant":
                     langchain_history.append(AIMessage(content=msg["content"]))
 
-            # Estimate input tokens from known LLM input messages.
             input_text_parts = [self._build_system_message(self.scene_description), instruction_text]
             input_text_parts.extend([str(m.content) for m in langchain_history if getattr(m, "content", None)])
             self._last_input_token_estimate = self._estimate_tokens("\n".join(input_text_parts))
 
-            # Invoke agent with instruction only (state will be in init block)
             agent_resp = self.agent_executor.invoke({
                 "input": instruction_text,
                 "chat_history": langchain_history
@@ -568,7 +607,6 @@ class Ros2HighLevelAgentNode(Node):
             self._last_output_token_estimate = self._estimate_tokens(final_text)
             self.get_logger().info(f"Agent output (raw):\n{final_text}")
 
-            # If the agent is asking a clarifying question (prefixed with NORMAL), just relay it
             final_text_stripped = final_text.strip()
             if final_text_stripped.upper().startswith("NORMAL"):
                 clarification = final_text_stripped[len("NORMAL"):].lstrip(" :")
@@ -604,16 +642,13 @@ class Ros2HighLevelAgentNode(Node):
                 "init": init_predicates,
             }
 
-            # Store JSON for reference
             json_result = PDDLGenerationResult(json_data=json_gen_data)
             self.latest_pddl = json_result
 
-            # Save JSON and generate PDDL using transform.py
             tmpdir = tempfile.mkdtemp(prefix="pddl_")
             json_path = Path(tmpdir) / "data.json"
             problem_path = Path(tmpdir) / "problem.pddl"
             
-            # Write JSON data to file
             json_data = {"data": json_gen_data}
             json_path.write_text(json.dumps(json_data, indent=2))
             self.get_logger().info(f"JSON data saved to {json_path}")
@@ -622,7 +657,6 @@ class Ros2HighLevelAgentNode(Node):
             template_problem = self._get_template_problem_path()
             domain_pddl = self._get_domain_pddl_path()
 
-            # Call transform.py to generate problem PDDL
             self.get_logger().info(
                 f"Calling transform.py to generate problem file with template: {template_problem}"
             )
@@ -637,7 +671,6 @@ class Ros2HighLevelAgentNode(Node):
 
             self.get_logger().debug(f"Problem:\n{problem_path.read_text()}")
 
-            # Run Fast Downward with domain.pddl and generated problem.pddl
             self.response_pub.publish(String(data="Solving the PDDL problem using Fast Downward"))
             self.tts_pub.publish(String(data="Now solving the planning problem."))
             plan_result = self._run_fast_downward(domain_pddl, str(problem_path))
@@ -652,7 +685,6 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().warn(f"Planner returned no plan. status={plan_result.status} rc={plan_result.return_code}")
                 self.response_pub.publish(String(data=msg))
                 self.tts_pub.publish(String(data="I couldn't find a valid plan for that request. Could you try rephrasing it?"))
-                # Keep last_goal_state intact - planning failed but state hasn't changed
                 return []
 
             self.get_logger().info("Plan obtained from Fast Downward. Parsing to steps...")
@@ -662,7 +694,6 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().warn("No actionable plan lines parsed.")
                 self.response_pub.publish(String(data=msg))
                 self.tts_pub.publish(String(data="I couldn't parse the plan into steps. Please try again."))
-                # Keep last_goal_state intact - parsing failed but state hasn't changed
                 return []
 
             self.latest_plan = plan_lines
@@ -672,7 +703,6 @@ class Ros2HighLevelAgentNode(Node):
                 self.response_pub.publish(String(
                     data=f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and confirm if this looks good!"
                 ))
-                # Create a more natural TTS version of the plan
                 tts_plan = ". ".join([s for s in plan_lines])
                 self.tts_pub.publish(String(data=f"Here is my plan: {tts_plan}. Please confirm if this looks good."))
                 self.get_logger().info(f"Generated plan with {len(plan_lines)} steps, waiting for /confirm.")
@@ -695,7 +725,6 @@ class Ros2HighLevelAgentNode(Node):
                             self.response_pub.publish(String(data=msg))
                             self.tts_pub.publish(String(data=f"Step {i} failed. Stopping execution."))
                             self.get_logger().error(msg)
-                            # Clear last goal state on execution failure - state is now uncertain after partial execution
                             self.last_goal_state = None
                             break
                         else:
@@ -711,7 +740,6 @@ class Ros2HighLevelAgentNode(Node):
                     self.tts_pub.publish(String(data="Plan execution finished."))
                     self.get_logger().info("All steps done. Storing goal state for continuous tracking.")
                     
-                    # Store goal state from successfully executed plan for next instruction
                     if self.latest_pddl and self.latest_pddl.json_data:
                         self.last_goal_state = self.latest_pddl.json_data.get("goals", [])
                         self.get_logger().info(f"Stored goal state for next instruction: {self.last_goal_state}")
@@ -730,7 +758,6 @@ class Ros2HighLevelAgentNode(Node):
             self.get_logger().error(f"Error generating plan: {e}")
             self.response_pub.publish(String(data="Sorry, something went wrong while planning."))
             self.tts_pub.publish(String(data="Sorry, something went wrong. Please try again."))
-            # Keep last_goal_state intact - planning exception but state hasn't changed
             return []
 
     def confirm_service_callback(self, request, response):
@@ -767,7 +794,6 @@ class Ros2HighLevelAgentNode(Node):
                     self.response_pub.publish(String(data=msg))
                     self.tts_pub.publish(String(data=f"Step {i} failed. Stopping execution."))
                     self.get_logger().error(msg)
-                    # Clear last goal state on execution failure - state is now uncertain after partial execution
                     self.last_goal_state = None
                     break
                 else:
@@ -780,7 +806,6 @@ class Ros2HighLevelAgentNode(Node):
             self.tts_pub.publish(String(data="Plan execution finished."))
             self.get_logger().info("All steps done. Storing goal state for continuous tracking.")
             
-            # Store goal state from successfully executed plan for next instruction
             if self.latest_pddl and self.latest_pddl.json_data:
                 self.last_goal_state = self.latest_pddl.json_data.get("goals", [])
                 self.get_logger().info(f"Stored goal state for next instruction: {self.last_goal_state}")
@@ -891,7 +916,6 @@ class Ros2HighLevelAgentNode(Node):
 
             parsed_items: List[Dict[str, Any]] = []
             for item in items:
-                # Preferred format: "predicate arg1 arg2"
                 if isinstance(item, str):
                     raw = " ".join(item.split())
                     if not raw:
@@ -903,7 +927,6 @@ class Ros2HighLevelAgentNode(Node):
                     })
                     continue
 
-                # Backward compatibility: {"predicate": "...", "args": [...]}
                 if isinstance(item, dict):
                     predicate = item.get("predicate")
                     args = item.get("args", [])
@@ -927,15 +950,12 @@ class Ros2HighLevelAgentNode(Node):
         text_stripped = text.strip()
         json_candidates = []
 
-        # Prefer fenced json blocks if present
         fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text_stripped, re.DOTALL)
         if fenced:
             json_candidates.append(fenced.group(1))
 
-        # Raw text as-is
         json_candidates.append(text_stripped)
 
-        # Largest brace-wrapped span fallback
         brace_start = text_stripped.find("{")
         brace_end = text_stripped.rfind("}")
         if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
@@ -961,7 +981,6 @@ class Ros2HighLevelAgentNode(Node):
         goals = base_data.get("goals", [])
         init = base_data.get("init", [])
 
-    
         if not isinstance(objects, list) or not isinstance(goals, list) or not isinstance(locations, list):
             self.get_logger().error("JSON does not contain list fields for objects/goals/locations")
             return None
@@ -1034,6 +1053,10 @@ class Ros2HighLevelAgentNode(Node):
         def vqa(question: str) -> str:
             """
             Call /vqa which returns an answer to a visual question.
+
+            ROS2 Jazzy fix: uses threading.Event + add_done_callback instead
+            of rclpy.spin_until_future_complete() to avoid re-entering the
+            already-spinning executor.
             """
             tool_name = "vqa"
             with self._tools_called_lock:
@@ -1042,18 +1065,48 @@ class Ros2HighLevelAgentNode(Node):
                 if not self.vision_vqa_client.wait_for_server(timeout_sec=5.0):
                     self.get_logger().error("/vqa action server unavailable")
                     return None
+
                 goal = Prompt.Goal()
                 goal.prompt = question
+
+                # --- Step 1: send goal and wait for acceptance ---
+                goal_event = threading.Event()
+                goal_handle_container = [None]
+
+                def goal_cb(future):
+                    goal_handle_container[0] = future.result()
+                    goal_event.set()
+
                 send_future = self.vision_vqa_client.send_goal_async(goal)
-                rclpy.spin_until_future_complete(self, send_future)
-                goal_handle = send_future.result()
-                if not goal_handle.accepted:
-                    self.get_logger().error("VQA goal rejected")
+                send_future.add_done_callback(goal_cb)
+
+                if not goal_event.wait(timeout=10.0):
+                    self.get_logger().error("VQA tool: timeout waiting for goal acceptance")
                     return None
+
+                goal_handle = goal_handle_container[0]
+                if not goal_handle.accepted:
+                    self.get_logger().error("VQA tool: goal rejected")
+                    return None
+
+                # --- Step 2: wait for result ---
+                result_event = threading.Event()
+                result_container = [None]
+
+                def result_cb(future):
+                    result_container[0] = future.result()
+                    result_event.set()
+
                 result_future = goal_handle.get_result_async()
-                rclpy.spin_until_future_complete(self, result_future)
-                result = result_future.result().result
+                result_future.add_done_callback(result_cb)
+
+                if not result_event.wait(timeout=30.0):
+                    self.get_logger().error("VQA tool: timeout waiting for result")
+                    return None
+
+                result = result_container[0].result
                 return result
+
             except Exception as e:
                 self.get_logger().error(f"Exception when sending to VQA: {e}")
                 return None
@@ -1391,6 +1444,7 @@ def main(args=None):
     except KeyboardInterrupt:
         node.get_logger().info("Shutting down Ros2 High-Level Agent Node (Fixed PDDL Domain).")
     finally:
+        node._state_query_node.destroy()
         node.destroy_node()
         rclpy.shutdown()
 
