@@ -4,6 +4,11 @@
   (:types
     location direction object
   )
+
+  (:constants
+    home ready handover  - location
+    left right up down forward backward - direction
+  )
   
   (:predicates
     (robot-at-location ?loc - location)

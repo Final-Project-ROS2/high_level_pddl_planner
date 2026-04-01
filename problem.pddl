@@ -2,17 +2,13 @@
   (:domain robot-manipulation)
 
   (:objects
-    home ready handover left-of-gear - location
-    left right up down forward backward - direction
-    gear - object
-    bolt - object
+    green_block - object
   )
   (:init
-    (robot-at-location home)
-    (gripper-open)
+    (gripper-open )
   )
   (:goal (and
-    (gripper-closed )
+    (gripper-close )
   ))
 )
-; This PDDL problem file was generated on 2026-02-25 11:16:23.319604
+; This PDDL problem file was generated on 2026-04-01 07:19:29.281386

@@ -13,7 +13,7 @@ class StateManager(Node):
         self.is_ready: bool = self.get_parameter("is_ready").get_parameter_value().bool_value
         self.declare_parameter("is_handover", False)
         self.is_handover: bool = self.get_parameter("is_handover").get_parameter_value().bool_value
-        self.declare_parameter("gripper_is_open", False)
+        self.declare_parameter("gripper_is_open", True)
         self.gripper_is_open: bool = self.get_parameter("gripper_is_open").get_parameter_value().bool_value
 
         # Service servers
