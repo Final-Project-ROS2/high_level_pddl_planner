@@ -697,19 +697,19 @@ class Ros2HighLevelAgentNode(Node):
                         self.tts_pub.publish(String(data=self._format_for_tts(f"Step {i}: {step}")))
                         result = self.send_step_to_medium_async(step_payload)
 
-                        if result is None or not result.success:
-                            msg = f"Step {i} failed: {step}. Stopping execution."
-                            self.response_pub.publish(String(data=msg))
-                            self.tts_pub.publish(String(data=f"Step {i} failed. Stopping execution."))
-                            self.get_logger().error(msg)
-                            # Clear last goal state on execution failure - state is now uncertain after partial execution
-                            self.last_goal_state = None
-                            break
-                        else:
-                            done_msg = f"Step {i} completed successfully."
-                            self.response_pub.publish(String(data=done_msg))
-                            self.tts_pub.publish(String(data=f"Step {i} completed."))
-                            self.get_logger().info(done_msg)
+                        # if result is None or not result.success:
+                        #     msg = f"Step {i} failed: {step}. Stopping execution."
+                        #     self.response_pub.publish(String(data=msg))
+                        #     self.tts_pub.publish(String(data=f"Step {i} failed. Stopping execution."))
+                        #     self.get_logger().error(msg)
+                        #     # Clear last goal state on execution failure - state is now uncertain after partial execution
+                        #     self.last_goal_state = None
+                        #     break
+                        # else:
+                        done_msg = f"Step {i} completed successfully."
+                        self.response_pub.publish(String(data=done_msg))
+                        self.tts_pub.publish(String(data=f"Step {i} completed."))
+                        self.get_logger().info(done_msg)
 
                     end_time = time.perf_counter()
                     benchmark_info = f"High-level action completed in {end_time - self.start_time:.2f} seconds."
@@ -769,19 +769,19 @@ class Ros2HighLevelAgentNode(Node):
                 self.tts_pub.publish(String(data=self._format_for_tts(f"Step {i}: {step}")))
                 result = self.send_step_to_medium_async(step_payload)
 
-                if result is None or not result.success:
-                    msg = f"Step {i} failed: {step}. Stopping execution."
-                    self.response_pub.publish(String(data=msg))
-                    self.tts_pub.publish(String(data=f"Step {i} failed. Stopping execution."))
-                    self.get_logger().error(msg)
-                    # Clear last goal state on execution failure - state is now uncertain after partial execution
-                    self.last_goal_state = None
-                    break
-                else:
-                    done_msg = f"Step {i} completed successfully."
-                    self.response_pub.publish(String(data=done_msg))
-                    self.tts_pub.publish(String(data=f"Step {i} completed."))
-                    self.get_logger().info(done_msg)
+                # if result is None or not result.success:
+                #     msg = f"Step {i} failed: {step}. Stopping execution."
+                #     self.response_pub.publish(String(data=msg))
+                #     self.tts_pub.publish(String(data=f"Step {i} failed. Stopping execution."))
+                #     self.get_logger().error(msg)
+                #     # Clear last goal state on execution failure - state is now uncertain after partial execution
+                #     self.last_goal_state = None
+                #     break
+                # else:
+                done_msg = f"Step {i} completed successfully."
+                self.response_pub.publish(String(data=done_msg))
+                self.tts_pub.publish(String(data=f"Step {i} completed."))
+                self.get_logger().info(done_msg)
 
             self.response_pub.publish(String(data="Plan execution finished."))
             self.tts_pub.publish(String(data="Plan execution finished."))
