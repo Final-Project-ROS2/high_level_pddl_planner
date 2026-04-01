@@ -16,6 +16,7 @@ from typing import List, Dict, Any, Optional
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionServer, ActionClient, CancelResponse, GoalResponse
 from rclpy.task import Future as RclpyFuture
 
@@ -1386,11 +1387,16 @@ class Ros2HighLevelAgentNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = Ros2HighLevelAgentNode()
+
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         node.get_logger().info("Shutting down Ros2 High-Level Agent Node (Fixed PDDL Domain).")
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
