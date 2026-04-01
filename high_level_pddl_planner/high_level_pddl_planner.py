@@ -17,6 +17,7 @@ from typing import List, Dict, Any, Optional
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.action import ActionServer, ActionClient, CancelResponse, GoalResponse
 from rclpy.task import Future as RclpyFuture
 
@@ -138,22 +139,25 @@ class Ros2HighLevelAgentNode(Node):
                 temperature=0.0,
             )
 
+        # Callback group
+        self.reentrant_callback_group = ReentrantCallbackGroup()
+
         # Transcript subscription
-        self.transcript_sub = self.create_subscription(String, "/transcript", self.transcript_callback, 10)
+        self.transcript_sub = self.create_subscription(String, "/transcript", self.transcript_callback, 10, callback_group=self.reentrant_callback_group)
         self._last_transcript_lock = threading.Lock()
         self._last_transcript: Optional[str] = None
 
         # Medium-level action client
-        self.medium_level_client = ActionClient(self, Prompt, "/medium_level")
+        self.medium_level_client = ActionClient(self, Prompt, "/medium_level", callback_group=self.reentrant_callback_group)
 
         # Vision clients
-        self.vision_vqa_client = ActionClient(self, Prompt, "/vqa")
+        self.vision_vqa_client = ActionClient(self, Prompt, "/vqa", callback_group=self.reentrant_callback_group)
 
         # State query service clients
-        self.is_home_client = self.create_client(GetSetBool, "/is_home")
-        self.is_ready_client = self.create_client(GetSetBool, "/is_ready")
-        self.is_handover_client = self.create_client(GetSetBool, "/is_handover")
-        self.gripper_is_open_client = self.create_client(GetSetBool, "/gripper_is_open")
+        self.is_home_client = self.create_client(GetSetBool, "/is_home", callback_group=self.reentrant_callback_group)
+        self.is_ready_client = self.create_client(GetSetBool, "/is_ready", callback_group=self.reentrant_callback_group)
+        self.is_handover_client = self.create_client(GetSetBool, "/is_handover", callback_group=self.reentrant_callback_group)
+        self.gripper_is_open_client = self.create_client(GetSetBool, "/gripper_is_open", callback_group=self.reentrant_callback_group)
 
         self._tools_called: List[str] = []
         self._tools_called_lock = threading.Lock()
@@ -169,8 +173,8 @@ class Ros2HighLevelAgentNode(Node):
         self._last_input_token_estimate = 0
         self._last_output_token_estimate = 0
 
-        self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
-        self.reset_state_srv = self.create_service(Trigger, "/reset_state", self.reset_state_callback)
+        self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback, callback_group=self.reentrant_callback_group)
+        self.reset_state_srv = self.create_service(Trigger, "/reset_state", self.reset_state_callback, callback_group=self.reentrant_callback_group)
 
         if self.domain_mode == "blocksworld":
             self.high_level_action_type = PromptSceneToken
@@ -184,6 +188,7 @@ class Ros2HighLevelAgentNode(Node):
             execute_callback=self.execute_callback,
             goal_callback=self.goal_callback,
             cancel_callback=self.cancel_callback,
+            callback_group=self.reentrant_callback_group,
         )
 
         self.response_pub = self.create_publisher(String, "/response", 10)
@@ -389,10 +394,10 @@ class Ros2HighLevelAgentNode(Node):
             req.set = False  # Just query, don't set
             req.value = False
             
-            future = client.call_async(req)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
+            resp = client.call(req)
+            # rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
             
-            resp = future.result()
+            # resp = future.result()
             if resp is None or not resp.success:
                 self.get_logger().warn(f"Failed to query {service_name}")
                 return None
@@ -1377,6 +1382,7 @@ class Ros2HighLevelAgentNode(Node):
                 return None
             
             result = result_container[0].result
+            self.get_logger().info(f"Received result from medium-level action: {result}")
             return result
             
         except Exception as e:
