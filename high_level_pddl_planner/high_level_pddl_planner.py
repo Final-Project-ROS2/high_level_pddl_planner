@@ -19,6 +19,7 @@ from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.action import ActionServer, ActionClient, CancelResponse, GoalResponse
+from action_msgs.msg import GoalStatus
 from rclpy.task import Future as RclpyFuture
 
 from std_srvs.srv import SetBool, Trigger
@@ -1050,16 +1051,46 @@ class Ros2HighLevelAgentNode(Node):
                     return None
                 goal = Prompt.Goal()
                 goal.prompt = question
+
+                goal_event = threading.Event()
+                result_event = threading.Event()
+                goal_handle_container = [None]
+                result_container = [None]
+
+                def goal_response_callback(future):
+                    goal_handle_container[0] = future.result()
+                    goal_event.set()
+
+                def result_callback(future):
+                    result_container[0] = future.result()
+                    result_event.set()
+
                 send_future = self.vision_vqa_client.send_goal_async(goal)
-                rclpy.spin_until_future_complete(self, send_future)
-                goal_handle = send_future.result()
-                if not goal_handle.accepted:
+                send_future.add_done_callback(goal_response_callback)
+
+                if not goal_event.wait(timeout=5.0):
+                    self.get_logger().error("Timeout waiting for VQA goal acceptance")
+                    return None
+
+                goal_handle = goal_handle_container[0]
+                if not goal_handle or not goal_handle.accepted:
                     self.get_logger().error("VQA goal rejected")
                     return None
+
                 result_future = goal_handle.get_result_async()
-                rclpy.spin_until_future_complete(self, result_future)
-                result = result_future.result().result
-                return result
+                result_future.add_done_callback(result_callback)
+
+                if not result_event.wait(timeout=60.0):
+                    self.get_logger().error("Timeout waiting for VQA result")
+                    return None
+
+                wrapped_result = result_container[0]
+                if wrapped_result is None:
+                    self.get_logger().error("VQA result future returned no data")
+                    return None
+
+                result_msg = wrapped_result.result
+                return getattr(result_msg, "final_response", None) or str(result_msg)
             except Exception as e:
                 self.get_logger().error(f"Exception when sending to VQA: {e}")
                 return None
@@ -1381,7 +1412,16 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().error("Timeout waiting for result")
                 return None
             
-            result = result_container[0].result
+            wrapped_result = result_container[0]
+            if wrapped_result is None:
+                self.get_logger().error("Medium-level result future returned no data")
+                return None
+
+            if wrapped_result.status != GoalStatus.STATUS_SUCCEEDED:
+                self.get_logger().error(f"Medium-level action did not succeed (status={wrapped_result.status})")
+                return None
+
+            result = wrapped_result.result
             self.get_logger().info(f"Received result from medium-level action: {result}")
             return result
             
