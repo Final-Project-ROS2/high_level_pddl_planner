@@ -1143,7 +1143,8 @@ class Ros2HighLevelAgentNode(Node):
         - Object names CANNOT contain spaces, use underscore
         - Do not wrap the JSON in Markdown fences.
         - You can add modifiers to the object name, like screwdriver_leftmost, so you DO NOT need to ask clarifying questions
-        - If the instruction is unclear, respond with a clarifying question prefixed with NORMAL and nothing else.
+        - If the user instruction reference an object using position (e.g. "second from the left") or color (e.g. "the red one"), use your vqa tool to findout what object the user is referring to
+        - If the instruction is unclear, try asking vqa first, then if the answer is still not EXPLICITLY clear, respond with a clarifying question prefixed with NORMAL and nothing else.
         - You may call tools like vqa if needed, but the final reply must still be the JSON described.
 
         Predicate hints:

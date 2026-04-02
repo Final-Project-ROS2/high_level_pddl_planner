@@ -2,6 +2,7 @@
   (:domain robot-manipulation)
 
   (:objects
+    {{ data.locations|join(' ') }} - location
     {% if data.objects %}
     {%- for obj in data.objects %}
     {{obj}} - object{% endfor %}
