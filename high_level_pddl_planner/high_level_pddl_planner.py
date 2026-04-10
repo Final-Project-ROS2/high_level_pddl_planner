@@ -447,6 +447,21 @@ class Ros2HighLevelAgentNode(Node):
         
         return init_predicates
 
+    def _filter_continuous_goal_predicates(self, goals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep only safe goal predicates for continuous state tracking."""
+        valid_locations = {"home", "ready", "handover"}
+        filtered: List[Dict[str, Any]] = []
+
+        for goal in goals:
+            args = [str(arg).strip().lower() for arg in goal.get("args", []) or []]
+            if not args:
+                filtered.append(goal)
+                continue
+            if all(arg in valid_locations for arg in args):
+                filtered.append(goal)
+
+        return filtered
+
     # -----------------------
     # Transcript handling
     # -----------------------
@@ -539,10 +554,13 @@ class Ros2HighLevelAgentNode(Node):
 
                 # Merge with last goal state if available (continuous state tracking)
                 if self.last_goal_state:
-                    self.get_logger().info(f"Merging previous goal state into init: {self.last_goal_state}")
+                    filtered_goals = self._filter_continuous_goal_predicates(self.last_goal_state)
+                    self.get_logger().info(
+                        f"Merging previous goal state into init (filtered): {filtered_goals}"
+                    )
                     # Add previous goals to init, avoiding duplicates
                     existing_predicates = {(p["predicate"], tuple(p.get("args", []))): p for p in init_predicates}
-                    for goal in self.last_goal_state:
+                    for goal in filtered_goals:
                         key = (goal["predicate"], tuple(goal.get("args", [])))
                         if key not in existing_predicates:
                             init_predicates.append(goal)
@@ -720,8 +738,10 @@ class Ros2HighLevelAgentNode(Node):
                     
                     # Store goal state from successfully executed plan for next instruction
                     if self.latest_pddl and self.latest_pddl.json_data:
-                        self.last_goal_state = self.latest_pddl.json_data.get("goals", [])
-                        self.get_logger().info(f"Stored goal state for next instruction: {self.last_goal_state}")
+                        self.last_goal_state = self._filter_continuous_goal_predicates(
+                            self.latest_pddl.json_data.get("goals", [])
+                        )
+                        self.get_logger().info(f"Stored filtered goal state for next instruction: {self.last_goal_state}")
                     
                     self.chat_history.clear()
                     self.latest_plan = None
@@ -789,8 +809,10 @@ class Ros2HighLevelAgentNode(Node):
             
             # Store goal state from successfully executed plan for next instruction
             if self.latest_pddl and self.latest_pddl.json_data:
-                self.last_goal_state = self.latest_pddl.json_data.get("goals", [])
-                self.get_logger().info(f"Stored goal state for next instruction: {self.last_goal_state}")
+                self.last_goal_state = self._filter_continuous_goal_predicates(
+                    self.latest_pddl.json_data.get("goals", [])
+                )
+                self.get_logger().info(f"Stored filtered goal state for next instruction: {self.last_goal_state}")
             
             self.chat_history.clear()
             self.latest_plan = None
